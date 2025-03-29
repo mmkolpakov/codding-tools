@@ -155,7 +155,7 @@ except Exception as error:
     sys.exit(1)
 
 def tokenize_text(text: str):
-    return ENCODER.encode(text)
+    return ENCODER.encode(text, disallowed_special=())
 
 def count_tokens(text: str) -> int:
     return len(tokenize_text(text))
