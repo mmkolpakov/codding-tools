@@ -1,1505 +1,875 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+from __future__ import annotations
+
+from dataclasses import dataclass, field, asdict
+import concurrent.futures
+import copy
+import importlib.util
+import io
+import json
 import logging
 import os
-import sys
-import json
-import threading
 import queue
 import re
+import shutil
+import sys
+import tempfile
+import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
-from pathlib import Path
-from typing import Dict, List, Callable, Optional, Any
-import importlib.util
-import time
-import concurrent.futures
-import io
 import tokenize
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from functools import lru_cache
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
+from typing import List, Optional, Tuple, Dict, Union
 
-REQUIRED_LIBRARIES = ["tiktoken", "charset_normalizer", "pygments"]
-missing_libraries = []
-for library in REQUIRED_LIBRARIES:
-    if importlib.util.find_spec(library) is None:
-        missing_libraries.append(library)
-if missing_libraries:
-    print(f"Required libraries not installed: {', '.join(missing_libraries)}")
-    print(f"Install them with: pip install {' '.join(missing_libraries)}")
+# --- Dependency Check ---
+def check_dependencies() -> List[str]:
+    required = ["tiktoken", "charset_normalizer", "pygments", "TKinterModernThemes"]
+    return [lib for lib in required if not importlib.util.find_spec(lib)]
+
+
+missing_deps = check_dependencies()
+if missing_deps:
+    msg = f"Missing required libraries: {', '.join(missing_deps)}.\nPlease run: pip install {' '.join(missing_deps)}"
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Dependency Error", msg)
+    except tk.TclError:
+        print(msg, file=sys.stderr)
     sys.exit(1)
 
+# --- Third-Party Imports ---
 import tiktoken
+import git
 from charset_normalizer import from_bytes
 from pygments.lexers import guess_lexer_for_filename
 from pygments.util import ClassNotFound
+import TKinterModernThemes as TKMT
 
-try:
-    import TKinterModernThemes as TKMT
-except ImportError:
-    print("TKinterModernThemes library is not installed")
-    print("Install it with: pip install TKinterModernThemes")
-    sys.exit(1)
 
-DEFAULT_CONFIG = {
-    "src_directories": [{"path": str(Path.home()), "selected": True}],
-    "output_file_template": "{project_name}_report.md",
-    "unified_output_file": "unified_report.md",
-    "extensions": ['.py', '.kt', '.kts', '.cpp', '.hpp', '.h', '.cs', '.sv'],
-    "include_libraries": False,
-    "remove_comments": True,
-    "preserve_docstrings": True,
-    "log_level": "INFO",
-    "selected_model": "Gemini",
-    "unified_report": True,
-    "custom_models": {},
-    "max_threads": 4,
-    "token_cache_size": 1000,
-    "chunk_size": 1024,
-    "max_file_size_mb": 50,
-    "ui_theme": "dark"
-}
+# --- Constants & Enums ---
+class SourceType(Enum):
+    LOCAL = "Local"
+    GIT = "Git"
 
-BUILTIN_MODEL_CONTEXT_SIZES = {
-    'gpt-3.5-turbo': 4096,
-    'gpt-4': 32768,
-    'gpt-4o': 128000,
-    'o1-mini': 65536,
-    'o1-preview': 25000,
-    'Gemini': 2000000,
-    'Claude': 200000,
-    'LearnLm': 32767,
-}
 
+class UIMode(Enum):
+    DARK = "dark"
+    LIGHT = "light"
+
+
+APP_NAME = "Code Report Generator"
+UI_THEME_NAME = "sun-valley"
+LOG_FILE = Path("debug.log")
 CONFIG_FILE = Path("config.json")
+REPORT_HEADER_TEXT = "# Unified Code Report"
+DEFAULT_MODEL = "Gemini 1.5 Pro"
+HANDLER_NAME_FILE = "CRG_FileHandler"
+HANDLER_NAME_UI = "CRG_UIHandler"
+BIN_DETECT_CHUNK_SIZE = 8192
+TOKEN_CACHE_SIZE = 8192
+
+EXCLUDED_DIRS = {'.git', '.svn', '.hg', '__pycache__', 'node_modules', 'vendor', 'build', 'dist', '.venv'}
+BUILTIN_MODEL_CONTEXT_SIZES = {
+    'gpt-4o': 128000, 'gpt-4-turbo': 128000, 'gpt-4': 32768,
+    'gpt-3.5-turbo-16k': 16385, DEFAULT_MODEL: 1000000,
+    'Claude 3 Opus': 200000, 'Claude 3 Sonnet': 200000,
+}
 
 
-class ConfigManager:
-    def __init__(self, config_file: Path):
-        self.config_file = config_file
-        self.config = DEFAULT_CONFIG.copy()
-        self.load_config()
-
-    def load_config(self) -> None:
-        if self.config_file.exists():
-            try:
-                with self.config_file.open("r", encoding="utf-8") as file:
-                    loaded_config = json.load(file)
-                self._update_config_recursively(self.config, loaded_config)
-                if self.config.get("src_directories") and isinstance(self.config["src_directories"][0], str):
-                    self.config["src_directories"] = [
-                        {"path": directory, "selected": True} for directory in self.config["src_directories"]
-                    ]
-            except json.JSONDecodeError as error:
-                logging.error(f"Error reading JSON: {error}")
-            except Exception as error:
-                logging.error(f"Error loading configuration: {error}")
-
-    def _update_config_recursively(self, target: Dict, source: Dict) -> None:
-        for key, value in source.items():
-            if (
-                key in target
-                and isinstance(target[key], dict)
-                and isinstance(value, dict)
-            ):
-                self._update_config_recursively(target[key], value)
-            else:
-                target[key] = value
-
-    def save_config(self) -> None:
-        try:
-            with self.config_file.open("w", encoding="utf-8") as file:
-                json.dump(self.config, file, indent=4, ensure_ascii=False)
-        except Exception as error:
-            logging.error(f"Error saving configuration: {error}")
+# --- Data Structures ---
+@dataclass
+class SourceConfig:
+    path: str
+    type: str
 
 
-config_manager = ConfigManager(CONFIG_FILE)
-
-log_queue = queue.Queue()
-
-
-class QueueHandler(logging.Handler):
-    """Класс-обёртка для пересылки логов в очередь"""
-    def __init__(self, log_queue: queue.Queue):
-        super().__init__()
-        self.log_queue = log_queue
-
-    def emit(self, record):
-        try:
-            message = self.format(record)
-            self.log_queue.put(message)
-        except Exception:
-            self.handleError(record)
+@dataclass
+class FileInfo:
+    file_path: Path
+    language: str
+    code_content: str
+    token_count: int
 
 
-logger = logging.getLogger("CodeReportGenerator")
-logger.setLevel(
-    getattr(logging, config_manager.config.get("log_level", "INFO").upper(), logging.INFO)
-)
-logger.propagate = False
+@dataclass
+class ProjectInfo:
+    project_name: str
+    project_path: Path
+    structure: str
+    files: List[FileInfo]
 
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-file_handler = logging.FileHandler("debug.log", encoding="utf-8", mode="w")
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
+@dataclass
+class AppConfig:
+    sources: List[SourceConfig] = field(default_factory=list)
+    unified_output_file: str = "unified_report.md"
+    extensions: List[str] = field(default_factory=lambda: ['.py', '.js', '.java', '.go', '.rs', '.html', '.css'])
+    include_libraries: bool = False
+    remove_comments: bool = True
+    preserve_docstrings: bool = True
+    log_level: str = "INFO"
+    selected_model: str = DEFAULT_MODEL
+    custom_models: Dict[str, int] = field(default_factory=dict)
+    max_threads: int = min(4, os.cpu_count() or 1)
+    max_file_size_mb: int = 50
+    ui_theme: str = UIMode.DARK.value
 
-queue_handler = QueueHandler(log_queue)
-queue_handler.setFormatter(formatter)
-logger.addHandler(queue_handler)
+
+# --- UI Event Queue Payloads ---
+@dataclass
+class StatusUpdate:
+    message: str
+
+
+@dataclass
+class ProgressUpdate:
+    current: int
+    total: int
+
+
+@dataclass
+class LogMessage:
+    level: int
+    message: str
+
+
+@dataclass
+class TaskFinished:
+    success: bool
+
+
+UIEvent = Union[StatusUpdate, ProgressUpdate, LogMessage, TaskFinished]
+
+# --- Setup ---
+logger = logging.getLogger(APP_NAME)
+ui_event_queue: queue.Queue[UIEvent] = queue.Queue(maxsize=5000)
+
+
+def setup_logging(level: str) -> None:
+    log_level = getattr(logging, level.upper(), logging.INFO)
+    logger.setLevel(log_level)
+
+    if any(h.name == HANDLER_NAME_FILE for h in logger.handlers):
+        for handler in logger.handlers:
+            if handler.name in {HANDLER_NAME_FILE, HANDLER_NAME_UI}:
+                handler.setLevel(log_level)
+        return
+
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(threadName)s - %(message)s')
+
+    try:
+        file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(log_level)
+        file_handler.name = HANDLER_NAME_FILE
+        logger.addHandler(file_handler)
+    except (IOError, PermissionError) as e:
+        print(f"Could not create log file handler: {e}", file=sys.stderr)
+
+    class UIQueueLogHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if not ui_event_queue.full():
+                ui_event_queue.put(LogMessage(level=record.levelno, message=self.format(record)))
+
+    queue_handler = UIQueueLogHandler()
+    queue_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] - %(message)s'))
+    queue_handler.setLevel(log_level)
+    queue_handler.name = HANDLER_NAME_UI
+    logger.addHandler(queue_handler)
+
+
+setup_logging("INFO")
 
 try:
     ENCODER = tiktoken.get_encoding("cl100k_base")
-except Exception as error:
-    logger.critical(f"Failed to initialize tiktoken encoder: {error}")
+except Exception as e:
+    logger.critical(f"Failed to initialize tiktoken encoder: {e}", exc_info=True)
     sys.exit(1)
 
-def tokenize_text(text: str):
-    return ENCODER.encode(text, disallowed_special=())
 
+@lru_cache(maxsize=TOKEN_CACHE_SIZE)
 def count_tokens(text: str) -> int:
-    return len(tokenize_text(text))
-
-def count_tokens_in_chunks(text: str, chunk_size: int) -> int:
-    total_tokens = 0
-    for i in range(0, len(text), chunk_size):
-        chunk = text[i:i + chunk_size]
-        total_tokens += len(tokenize_text(chunk))
-    return total_tokens
+    return len(ENCODER.encode(text, disallowed_special=()))
 
 
+# --- Core Logic ---
 class CodeProcessor:
-    def __init__(self):
-        self.extension_to_language = {
-            '.py': 'python',
-            '.js': 'javascript',
-            '.html': 'html',
-            '.css': 'css',
-            '.java': 'java',
-            '.cpp': 'cpp',
-            '.c': 'c',
-            '.h': 'c',
-            '.hpp': 'cpp',
-            '.cs': 'csharp',
-            '.kt': 'kotlin',
-            '.kts': 'kotlin',
-            '.go': 'go',
-            '.rb': 'ruby',
-            '.php': 'php',
-            '.sh': 'bash',
-            '.bat': 'batch',
-            '.ps1': 'powershell',
-            '.sql': 'sql',
-            '.md': 'markdown',
-            '.json': 'json',
-            '.xml': 'xml',
-            '.yml': 'yaml',
-            '.yaml': 'yaml',
-            '.sv': 'systemverilog'
-        }
-
     def is_binary(self, file_path: Path) -> bool:
-        """Простая эвристика для проверки, не двоичный ли файл"""
         try:
-            with file_path.open('rb') as file:
-                chunk = file.read(512)
-                return (
-                    b'\0' in chunk or
-                    sum(1 for b in chunk if b < 8 or 127 < b < 192) > len(chunk) * 0.3
-                )
-        except (IOError, OSError) as error:
-            logger.error(f"Error checking file {file_path}: {error}", exc_info=True)
-            return True
-        except Exception as error:
-            logger.error(f"Unexpected error checking file {file_path}: {error}", exc_info=True)
+            with file_path.open('rb') as f:
+                chunk = f.read(BIN_DETECT_CHUNK_SIZE)
+            if not chunk: return False
+            if b'\0' in chunk: return True
+            if len(chunk) < 256: return False
+
+            non_text_chars = sum(1 for byte in chunk if byte < 9 or (13 < byte < 32 and byte != 27) or byte > 127)
+            return non_text_chars / len(chunk) > 0.3
+        except (IOError, OSError) as e:
+            logger.warning(f"Could not check file type for {file_path}: {e}", exc_info=True)
             return True
 
-    def detect_encoding(self, file_path: Path, max_file_size_mb: int) -> Optional[str]:
-        """Определяем кодировку файла с помощью charset_normalizer"""
+    def detect_encoding(self, file_path: Path, max_size_mb: int) -> Optional[str]:
         try:
             file_size = file_path.stat().st_size
-            if file_size > max_file_size_mb * 1024 * 1024:
-                logger.warning(
-                    f"File {file_path} is too large (> {max_file_size_mb} MB), will be skipped."
-                )
-                raise ValueError(f"File is too large (> {max_file_size_mb} MB)")
+            if file_size > max_size_mb * 1024 * 1024:
+                logger.warning(f"File {file_path} is too large (> {max_size_mb}MB), skipping.")
+                return None
 
-            with file_path.open('rb') as file:
-                raw_data = file.read(min(file_size, 100000))
-
+            read_size = min(file_size, 256 * 1024)
+            with file_path.open('rb') as f:
+                raw_data = f.read(read_size)
             result = from_bytes(raw_data).best()
             return result.encoding if result else 'utf-8'
-        except (IOError, OSError) as error:
-            logger.error(f"Error detecting encoding for file {file_path}: {error}", exc_info=True)
-            return None
-        except Exception as error:
-            logger.error(f"Unexpected error detecting encoding for file {file_path}: {error}", exc_info=True)
+        except (IOError, OSError) as e:
+            logger.error(f"Error detecting encoding for {file_path}: {e}", exc_info=True)
             return None
 
     def read_file_safely(self, file_path: Path, encoding: str) -> Optional[str]:
-        """Безопасно читаем файл, заменяя битые символы"""
         try:
-            with file_path.open('r', encoding=encoding, errors='replace') as file:
-                return file.read()
-        except (IOError, OSError) as error:
-            logger.error(f"Error reading file {file_path}: {error}", exc_info=True)
-            return None
-        except Exception as error:
-            logger.error(f"Unexpected error reading file {file_path}: {error}", exc_info=True)
+            return file_path.read_text(encoding=encoding, errors='replace')
+        except (IOError, OSError) as e:
+            logger.error(f"Error reading file {file_path}: {e}", exc_info=True)
             return None
 
-    def remove_python_comments(self, source_code: str, preserve_docstrings: bool = True) -> str:
-        """
-        Удаляем комментарии из Python-кода, при желании — docstrings.
-        Логика покрывает большинство базовых случаев.
-        """
-        result = []
+    def remove_python_comments(self, source: str, preserve_docstrings: bool) -> str:
         try:
-            tokens = tokenize.tokenize(io.BytesIO(source_code.encode('utf-8')).readline)
+            tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+            if preserve_docstrings:
+                return tokenize.untokenize(t for t in tokens if t.type != tokenize.COMMENT)
 
-            prev_token_type = None
-            prev_token_string = None
-            last_line = 1
-            last_col = 0
+            result_tokens = []
+            for i, token in enumerate(tokens):
+                if token.type == tokenize.COMMENT: continue
+                if token.type == tokenize.STRING and i > 0 and tokens[i - 1].type in {tokenize.NEWLINE, tokenize.NL,
+                                                                                      tokenize.INDENT}:
+                    continue
+                result_tokens.append(token)
+            return tokenize.untokenize(result_tokens)
+        except (tokenize.TokenError, IndentationError) as e:
+            logger.warning(f"Python tokenization failed: {e}. Falling back to basic regex.")
+            return re.sub(r'#.*', '', source)
 
-            for token in tokens:
-                token_type = token.type
-                token_string = token.string
-                start_line, start_col = token.start
-                end_line, end_col = token.end
+    def remove_comments(self, file_path: Path, source: str, preserve_docstrings: bool) -> str:
+        if file_path.suffix.lower() == '.py':
+            return self.remove_python_comments(source, preserve_docstrings)
+        pattern = r"//.*?$|/\*.*?\*/|--.*?$"
+        return re.sub(pattern, "", source, flags=re.MULTILINE | re.DOTALL)
 
-                if start_line > last_line:
-                    result.append('\n' * (start_line - last_line))
-                    last_col = 0
-
-                if start_col > last_col:
-                    result.append(' ' * (start_col - last_col))
-
-                if token_type == tokenize.COMMENT:
-
-                    pass
-                elif token_type == tokenize.STRING:
-                    is_docstring = (
-                        prev_token_type == tokenize.INDENT
-                        or prev_token_string in ('class', 'def')
-                        or (prev_token_type == tokenize.NEWLINE and start_col == 0)
-                    )
-                    if is_docstring and not preserve_docstrings:
-                        pass
-                    else:
-                        result.append(token_string)
-                else:
-                    result.append(token_string)
-
-                prev_token_type = token_type
-                prev_token_string = token_string
-                last_line, last_col = end_line, end_col
-
-            return ''.join(result)
-        except tokenize.TokenError:
-            return self._remove_comments_regex(source_code, preserve_docstrings)
-
-    def _remove_comments_regex(self, source_code: str, preserve_docstrings: bool = True) -> str:
-        """
-        Простейший regex-based метод на случай проблем с tokenize
-        """
-        lines = source_code.splitlines()
-        result = []
-        in_multiline = False
-
-        for line in lines:
-            stripped = line.strip()
-
-            if in_multiline:
-                if '"""' in line or "'''" in line:
-                    in_multiline = False
-                    if preserve_docstrings:
-                        result.append(line)
-                elif preserve_docstrings:
-                    result.append(line)
-            else:
-                if stripped.startswith('#'):
-                    result.append('')
-                elif '#' in line:
-                    result.append(line.split('#', 1)[0])
-                elif stripped.startswith('"""') or stripped.startswith("'''"):
-                    in_multiline = True
-                    if preserve_docstrings:
-                        result.append(line)
-                else:
-                    result.append(line)
-
-        return '\n'.join(result)
-
-    def remove_comments(self, file_path: Path, source_code: str, preserve_docstrings: bool) -> str:
-        """Универсальная точка входа для удаления комментариев (Python и др. языки)"""
-        suffix = file_path.suffix.lower()
-        if suffix == '.py':
-            return self.remove_python_comments(source_code, preserve_docstrings)
-        # TODO
-        return source_code
-
-    def detect_language(self, file_path: Path, code_content: str) -> str:
-        """Определяем язык с помощью Pygments; при неудаче используем словарь расширений"""
+    def detect_language(self, file_path: Path, content: str) -> str:
         try:
-            lexer = guess_lexer_for_filename(file_path.name, code_content)
+            lexer = guess_lexer_for_filename(file_path.name, content)
             return lexer.aliases[0] if lexer.aliases else lexer.name.lower()
         except ClassNotFound:
-            return self.extension_to_language.get(file_path.suffix.lower(), 'text')
+            return file_path.suffix.lstrip('.').lower() or 'text'
 
 
 class ProjectProcessor:
-    def __init__(
-        self,
-        config: Dict,
-        progress_callback: Optional[Callable] = None,
-        status_callback: Optional[Callable] = None
-    ):
+    def __init__(self, config: AppConfig, code_processor: CodeProcessor,
+                 executor: concurrent.futures.Executor, ui_queue: queue.Queue[UIEvent]):
         self.config = config
-        self.progress_callback = progress_callback
-        self.status_callback = status_callback
+        self.code_processor = code_processor
+        self.executor = executor
+        self.ui_queue = ui_queue
         self.cancel_flag = threading.Event()
-        self.code_processor = CodeProcessor()
+        self.temp_dirs: List[Path] = []
 
-        models = {**BUILTIN_MODEL_CONTEXT_SIZES, **self.config.get("custom_models", {})}
-        selected_model = self.config.get("selected_model", "Gemini")
-        self.max_tokens = models.get(selected_model, 2000000)
+        models = {**BUILTIN_MODEL_CONTEXT_SIZES, **self.config.custom_models}
+        self.max_tokens = models.get(self.config.selected_model, 128000)
+        self.report_header_full = f"{REPORT_HEADER_TEXT}\n\n"
+        self.report_header_tokens = count_tokens(self.report_header_full)
 
-        self.executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.config.get("max_threads", 4)
+    def cancel(self):
+        self.cancel_flag.set()
+        self.ui_queue.put(StatusUpdate(message="Cancellation requested by user."))
+
+    def _clone_repo(self, url: str) -> Optional[Path]:
+        try:
+            temp_dir = Path(tempfile.mkdtemp(prefix="crg_"))
+            self.ui_queue.put(StatusUpdate(message=f"Cloning {url}..."))
+            git.Repo.clone_from(url, temp_dir, depth=1)
+            self.temp_dirs.append(temp_dir)
+            self.ui_queue.put(StatusUpdate(message="Clone successful."))
+            return temp_dir
+        except git.GitCommandError as e:
+            logger.error(f"Failed to clone {url}: {e}", exc_info=True)
+            self.ui_queue.put(StatusUpdate(message=f"Error cloning {url}."))
+            return None
+
+    def _process_file(self, file_path: Path) -> Optional[FileInfo]:
+        if self.cancel_flag.is_set(): return None
+
+        encoding = self.code_processor.detect_encoding(file_path, self.config.max_file_size_mb)
+        if not encoding: return None
+
+        content = self.code_processor.read_file_safely(file_path, encoding)
+        if content is None: return None
+
+        if self.config.remove_comments:
+            content = self.code_processor.remove_comments(file_path, content, self.config.preserve_docstrings)
+
+        return FileInfo(
+            file_path=file_path,
+            language=self.code_processor.detect_language(file_path, content),
+            code_content=content.strip(),
+            token_count=count_tokens(content)
         )
 
-        self.chunk_size = self.config.get("chunk_size", 1024)
+    def _gather_project_files(self, project_path: Path) -> Tuple[List[Path], str]:
+        files_to_scan = []
+        structure_dirs = set()
+        extensions = set(self.config.extensions)
+        use_wildcard = "*" in extensions
 
-    def update_status(self, message: str) -> None:
-        if self.status_callback:
-            self.status_callback(message)
-        logger.info(message)
+        for root, dirs, files in os.walk(project_path, topdown=True):
+            if self.cancel_flag.is_set(): break
 
-    def update_progress(self, current: int, total: int) -> None:
-        if self.progress_callback:
-            self.progress_callback(current, total)
+            if not self.config.include_libraries:
+                dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith('.')]
 
-    def cancel(self) -> None:
-        self.cancel_flag.set()
-        logger.info("Operation canceled by user.")
+            for file_name in files:
+                file_path = Path(root) / file_name
+                if use_wildcard or file_path.suffix.lower() in extensions:
+                    if not self.code_processor.is_binary(file_path):
+                        files_to_scan.append(file_path)
+                        structure_dirs.add(Path(root))
 
-    def process_project(self, src_directory: Path, extensions: List[str]) -> Optional[Dict]:
-        """Сканируем директорию, обрабатываем файлы в пуле потоков"""
-        if self.cancel_flag.is_set():
-            return None
-        try:
-            self.update_status(f"Processing project: {src_directory}")
+        structure_text = self._build_structure_text(project_path, structure_dirs)
+        return sorted(files_to_scan), structure_text
 
-            if not src_directory.exists() or not src_directory.is_dir():
-                logger.error(f"Directory {src_directory} does not exist or is not a directory.")
-                return None
+    def _build_structure_text(self, root: Path, dirs: set) -> str:
+        lines = ["### Project Structure:\n"]
+        sorted_paths = sorted(list(p for p in dirs if p != root), key=lambda p: p.as_posix())
 
-            project_name = src_directory.name
-            project_structure = []
-            files_info = []
-            total_files = 0
-            processed_files = 0
-
-            for root, directories, files in os.walk(src_directory):
-                current_path = Path(root)
-                try:
-                    relative_parts = current_path.relative_to(src_directory).parts
-                except ValueError:
-                    continue
-
-                if not self.config.get("include_libraries", False) and any(
-                    part.startswith('.') or part == '__pycache__' for part in relative_parts
-                ):
-                    continue
-
-                for file_name in files:
-                    file_path = current_path / file_name
-                    if file_path.suffix.lower() in extensions:
-                        total_files += 1
-
-            if total_files == 0:
-                logger.warning(f"No matching files found in project {project_name}.")
-                return {
-                    'project_name': project_name,
-                    'project_structure': [],
-                    'files_info': [],
-                    'project_path': src_directory
-                }
-
-            for root, directories, files in os.walk(src_directory):
-                if self.cancel_flag.is_set():
-                    return None
-
-                current_path = Path(root)
-                try:
-                    relative_parts = current_path.relative_to(src_directory).parts
-                except ValueError:
-                    continue
-
-                if not self.config.get("include_libraries", False) and any(
-                    part.startswith('.') or part == '__pycache__' for part in relative_parts
-                ):
-                    continue
-
-                level = len(relative_parts)
-                indent = '  ' * level
-                project_structure.append(f"{indent}- {current_path.name}/\n")
-
-                future_to_file = {}
-                for file_name in files:
-                    file_path = current_path / file_name
-                    if file_path.suffix.lower() in extensions:
-                        if not self.code_processor.is_binary(file_path):
-                            future = self.executor.submit(
-                                self._process_file, file_path, src_directory
-                            )
-                            future_to_file[future] = file_path
-
-                for future in concurrent.futures.as_completed(future_to_file):
-                    if self.cancel_flag.is_set():
-                        return None
-
-                    file_path = future_to_file[future]
-                    processed_files += 1
-
-                    try:
-                        file_info = future.result()
-                        if file_info:
-                            files_info.append(file_info)
-                    except Exception as exc:
-                        logger.error(f"Processing file {file_path} raised exception: {exc}", exc_info=True)
-
-                    self.update_progress(processed_files, total_files)
-
-            return {
-                'project_name': project_name,
-                'project_structure': project_structure,
-                'files_info': files_info,
-                'project_path': src_directory
-            }
-
-        except Exception as error:
-            logger.error(f"Error processing project {src_directory}: {error}", exc_info=True)
-            return None
-
-    def _process_file(self, file_path: Path, project_path: Path) -> Optional[Dict]:
-        """Обработка отдельного файла: чтение, удаление комментариев (если нужно), определение языка"""
-        try:
-            encoding = self.code_processor.detect_encoding(
-                file_path,
-                self.config.get("max_file_size_mb", 50)
-            )
-            if not encoding:
-                return None
-
-            code_content = self.code_processor.read_file_safely(file_path, encoding)
-            if not code_content:
-                return None
-
-            if self.config.get("remove_comments", True):
-                code_content = self.code_processor.remove_comments(
-                    file_path,
-                    code_content,
-                    self.config.get("preserve_docstrings", True)
-                )
-
-            language = self.code_processor.detect_language(file_path, code_content)
-
-            return {
-                'file_path': file_path,
-                'language': language,
-                'code_content': code_content
-            }
-        except Exception as error:
-            logger.error(f"Error processing file {file_path}: {error}", exc_info=True)
-            return None
-
-    def generate_reports(self, projects_info: List[Dict]) -> bool:
-        """Создаём результирующие Markdown-отчёты (либо единый, либо несколько частей)"""
-        if not projects_info:
-            self.update_status("No projects to process.")
-            return False
-
-        try:
-            self.update_status("Generating reports...")
-            report_parts = []
-            current_part = []
-            current_tokens = 0
-
-            initial_header = "# Unified Project Report\n\n"
-            current_part.append(initial_header)
-            current_tokens += count_tokens(initial_header)
-
-            for project_index, project_info in enumerate(projects_info):
-                if self.cancel_flag.is_set():
-                    return False
-
-                project_header = f"## Project: {project_info['project_name']}\n\n"
-                project_structure = f"### Project Structure:\n{''.join(project_info['project_structure'])}\n\n"
-
-                project_header_tokens = count_tokens(project_header)
-                project_structure_tokens = count_tokens(project_structure)
-
-                if current_tokens + project_header_tokens > self.max_tokens:
-                    report_parts.append("".join(current_part))
-                    current_part = [project_header]
-                    current_tokens = project_header_tokens
-                else:
-                    current_part.append(project_header)
-                    current_tokens += project_header_tokens
-
-                if current_tokens + project_structure_tokens > self.max_tokens:
-                    report_parts.append("".join(current_part))
-                    current_part = [project_structure]
-                    current_tokens = project_structure_tokens
-                else:
-                    current_part.append(project_structure)
-                    current_tokens += project_structure_tokens
-
-                total_files = len(project_info['files_info'])
-                for file_index, file_info in enumerate(project_info['files_info']):
-                    if self.cancel_flag.is_set():
-                        return False
-
-                    self.update_status(
-                        f"Processing file {file_index + 1}/{total_files} in project {project_info['project_name']}"
-                    )
-
-                    try:
-                        relative_file_path = file_info['file_path'].relative_to(project_info['project_path'])
-                    except ValueError:
-                        relative_file_path = file_info['file_path']
-
-                    file_section = (
-                        f"#### {relative_file_path}\n\n"
-                        f"```{file_info['language']}\n{file_info['code_content']}\n```\n\n"
-                    )
-
-                    file_tokens = count_tokens_in_chunks(file_section, self.chunk_size)
-
-                    if file_tokens > self.max_tokens:
-                        code_lines = file_info['code_content'].splitlines(keepends=True)
-                        chunk = []
-                        chunk_tokens = 0
-                        line_number = 1
-
-                        for index, line in enumerate(code_lines, start=1):
-                            line_tokens = count_tokens(line)
-
-                            if chunk_tokens + line_tokens > self.max_tokens:
-                                chunk_content = ''.join(chunk)
-                                chunk_section = (
-                                    f"#### {relative_file_path} (lines {line_number}-{index - 1})\n\n"
-                                    f"```{file_info['language']}\n{chunk_content}\n```\n\n"
-                                )
-                                chunk_section_tokens = count_tokens_in_chunks(chunk_section, self.chunk_size)
-
-                                if current_tokens + chunk_section_tokens > self.max_tokens:
-                                    report_parts.append("".join(current_part))
-                                    current_part = [chunk_section]
-                                    current_tokens = chunk_section_tokens
-                                else:
-                                    current_part.append(chunk_section)
-                                    current_tokens += chunk_section_tokens
-
-                                chunk = [line]
-                                chunk_tokens = line_tokens
-                                line_number = index
-                            else:
-                                chunk.append(line)
-                                chunk_tokens += line_tokens
-
-                        if chunk:
-                            chunk_content = ''.join(chunk)
-                            chunk_section = (
-                                f"#### {relative_file_path} (lines {line_number}-{index})\n\n"
-                                f"```{file_info['language']}\n{chunk_content}\n```\n\n"
-                            )
-                            chunk_section_tokens = count_tokens_in_chunks(chunk_section, self.chunk_size)
-
-                            if current_tokens + chunk_section_tokens > self.max_tokens:
-                                report_parts.append("".join(current_part))
-                                current_part = [chunk_section]
-                                current_tokens = chunk_section_tokens
-                            else:
-                                current_part.append(chunk_section)
-                                current_tokens += chunk_section_tokens
-                    else:
-                        if current_tokens + file_tokens > self.max_tokens:
-                            report_parts.append("".join(current_part))
-                            current_part = [file_section]
-                            current_tokens = file_tokens
-                        else:
-                            current_part.append(file_section)
-                            current_tokens += file_tokens
-
-                    self.update_progress(
-                        project_index * 100 + (file_index + 1) * 100 // max(total_files, 1),
-                        len(projects_info) * 100
-                    )
-
-            if current_part:
-                report_parts.append("".join(current_part))
-
-            self._save_reports(report_parts, initial_header)
-            return True
-
-        except Exception as error:
-            logger.error(f"Error generating reports: {error}", exc_info=True)
-            return False
-
-    def _save_reports(self, report_parts: List[str], initial_header: str) -> None:
-        """Сохранение собранных частей отчетов на диск"""
-        output_file_template = Path(self.config.get("output_file_template", "{project_name}_report.md"))
-        unified_output_file = Path(self.config.get("unified_output_file", "unified_report.md"))
-        unified_report = self.config.get("unified_report", True)
-
-        self.update_status(f"Saving reports ({len(report_parts)} parts)...")
-
-        for index, part in enumerate(report_parts):
-            if self.cancel_flag.is_set():
-                return
-
+        for path in sorted_paths:
             try:
-                if unified_report:
-                    if len(report_parts) == 1:
-                        part_file_path = unified_output_file
-                    else:
-                        part_file_path = unified_output_file.with_name(
-                            f"{unified_output_file.stem}_part{index + 1}{unified_output_file.suffix}"
-                        )
-                    part_content = part
-                else:
-                    part_file_path = output_file_template.with_name(
-                        f"{output_file_template.stem}_part{index + 1}{output_file_template.suffix}"
-                    )
-                    part_content = part
+                relative_parts = path.relative_to(root).parts
+                level = len(relative_parts)
+                lines.append(f"{'  ' * (level - 1)}- {path.name}/\n")
+            except ValueError:
+                continue
+        return "".join(lines) + "\n"
 
-                part_file_path.parent.mkdir(parents=True, exist_ok=True)
-
-                with part_file_path.open("w", encoding="utf-8") as file:
-                    file.write(part_content)
-
-                logger.info(f"Report part {index + 1} saved to {part_file_path}")
-
-            except Exception as error:
-                logger.error(f"Error writing to file {part_file_path}: {error}", exc_info=True)
-
-        self.update_status("Reports saved. Processing complete.")
-
-    def run(self) -> bool:
-        """Главная точка запуска обработки"""
+    def run(self) -> None:
+        all_projects_info: List[ProjectInfo] = []
         try:
-            self.cancel_flag.clear()
+            sources_to_process = self.config.sources
+            total_projects = len(sources_to_process)
+            for i, source in enumerate(sources_to_process, 1):
+                if self.cancel_flag.is_set(): break
+                self.ui_queue.put(StatusUpdate(message=f"Processing project {i}/{total_projects}: {source.path}"))
 
-            source_directories = [
-                Path(item["path"]) for item in self.config.get("src_directories", [])
-                if item.get("selected", True) and Path(item["path"]).is_dir()
-            ]
-            if not source_directories:
-                self.update_status("Source directory list is empty or inaccessible.")
-                return False
+                try:
+                    source_type = SourceType[source.type.upper()]
+                except KeyError:
+                    logger.error(f"Invalid source type in config: {source.type}")
+                    continue
 
-            extensions = [ext.strip().lower() for ext in self.config.get("extensions", [])]
-            if not extensions:
-                self.update_status("File extension list is empty.")
-                return False
+                project_name: str
+                project_path: Optional[Path]
 
-            self.update_status(f"Starting to process {len(source_directories)} directories...")
-            projects_info = []
+                if source_type == SourceType.GIT:
+                    project_name = Path(source.path).stem
+                    project_path = self._clone_repo(source.path)
+                else:
+                    project_path = Path(source.path)
+                    project_name = project_path.name
 
-            for index, source_directory in enumerate(source_directories):
-                if self.cancel_flag.is_set():
-                    self.update_status("Operation canceled by user.")
-                    return False
+                if not project_path or not project_path.is_dir():
+                    logger.warning(f"Source not valid or failed to clone: {source.path}")
+                    continue
 
-                self.update_status(f"Processing project {index + 1}/{len(source_directories)}: {source_directory}")
-                project_info = self.process_project(source_directory, extensions)
-                if project_info:
-                    projects_info.append(project_info)
+                files_to_process, structure = self._gather_project_files(project_path)
+                total_files = len(files_to_process)
+                if total_files == 0: continue
 
-                self.update_progress(index + 1, len(source_directories))
+                processed_files: List[FileInfo] = []
+                futures = {self.executor.submit(self._process_file, fp): fp for fp in files_to_process}
+
+                for processed_count, future in enumerate(concurrent.futures.as_completed(futures), 1):
+                    if self.cancel_flag.is_set(): break
+                    try:
+                        result = future.result()
+                        if result: processed_files.append(result)
+                    except Exception as e:
+                        file_path = futures[future]
+                        logger.error(f"Error processing file {file_path}: {e}", exc_info=True)
+
+                    self.ui_queue.put(ProgressUpdate(current=processed_count, total=total_files))
+
+                if not self.cancel_flag.is_set():
+                    all_projects_info.append(ProjectInfo(
+                        project_name=project_name, project_path=project_path,
+                        structure=structure, files=sorted(processed_files, key=lambda f: f.file_path)
+                    ))
 
             if not self.cancel_flag.is_set():
-                return self.generate_reports(projects_info)
-            else:
-                self.update_status("Operation canceled by user.")
-                return False
+                report_parts = self._generate_report_parts(all_projects_info)
+                self._save_reports(report_parts)
 
-        except Exception as error:
-            logger.error(f"Error during processing: {error}", exc_info=True)
-            self.update_status(f"An error occurred: {error}")
-            return False
+            self.ui_queue.put(TaskFinished(success=not self.cancel_flag.is_set()))
+
+        except Exception as e:
+            logger.critical(f"Unhandled exception in processor thread: {e}", exc_info=True)
+            self.ui_queue.put(TaskFinished(success=False))
         finally:
-            self.executor.shutdown(wait=False)
+            for temp_dir in self.temp_dirs:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def _generate_report_parts(self, all_projects: List[ProjectInfo]) -> List[str]:
+        self.ui_queue.put(StatusUpdate(message="Generating report parts..."))
+        report_parts = []
 
-class DirectorySelectionFrame(ttk.Frame):
-    """
-    Фрейм для работы со списком директорий (добавление, удаление).
-    """
-    def __init__(self, parent, config_manager: ConfigManager, **kwargs):
-        super().__init__(parent, **kwargs)
-        self.config_manager = config_manager
-        self.vars: Dict[str, tk.BooleanVar] = {}
-        self.create_widgets()
+        current_part = [self.report_header_full]
+        current_tokens = self.report_header_tokens
 
-    def create_widgets(self):
-        self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0, height=200)
-        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        for project in all_projects:
+            if self.cancel_flag.is_set(): break
 
-        self.inner_frame = ttk.Frame(self.canvas)
-        self.inner_frame.bind(
-            "<Configure>",
-            lambda event: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        )
+            project_header = f"## Project: {project.project_name}\n\n{project.structure}"
+            project_header_tokens = count_tokens(project_header)
 
-        self.canvas.create_window((0, 0), window=self.inner_frame, anchor="nw")
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
-
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.scrollbar.pack(side="right", fill="y")
-
-        self.populate()
-
-        self.bind("<Enter>", self._bind_mousewheel)
-        self.bind("<Leave>", self._unbind_mousewheel)
-
-    def _bind_mousewheel(self, event):
-        if sys.platform.startswith('win'):
-            self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-        elif sys.platform.startswith('darwin'):
-            self.canvas.bind_all("<MouseWheel>", self._on_mousewheel_macos)
-        else:
-            self.canvas.bind_all("<Button-4>", self._on_mousewheel_linux)
-            self.canvas.bind_all("<Button-5>", self._on_mousewheel_linux)
-
-    def _unbind_mousewheel(self, event):
-        if sys.platform.startswith('win'):
-            self.canvas.unbind_all("<MouseWheel>")
-        elif sys.platform.startswith('darwin'):
-            self.canvas.unbind_all("<MouseWheel>")
-        else:
-            self.canvas.unbind_all("<Button-4>")
-            self.canvas.unbind_all("<Button-5>")
-
-    def _on_mousewheel(self, event):
-        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-    def _on_mousewheel_macos(self, event):
-        self.canvas.yview_scroll(int(-1 * event.delta), "units")
-
-    def _on_mousewheel_linux(self, event):
-        if event.num == 4:
-            self.canvas.yview_scroll(-1, "units")
-        elif event.num == 5:
-            self.canvas.yview_scroll(1, "units")
-
-    def populate(self):
-        for child in self.inner_frame.winfo_children():
-            child.destroy()
-        self.vars.clear()
-
-        for item in self.config_manager.config.get("src_directories", []):
-            variable = tk.BooleanVar(value=item.get("selected", True))
-
-            def on_variable_change(name, index, mode, item=item, var=variable):
-                self.on_toggle(item, var)
-
-            variable.trace_add("write", on_variable_change)
-
-            frame = ttk.Frame(self.inner_frame)
-            frame.pack(fill="x", padx=2, pady=1)
-
-            checkbox = ttk.Checkbutton(
-                frame,
-                variable=variable,
-                padding=0
-            )
-            checkbox.pack(side="left", padx=0, pady=0)
-
-            path_label = ttk.Label(
-                frame,
-                text=item["path"],
-                wraplength=400
-            )
-            path_label.pack(side="left", fill="x", expand=True, padx=2, pady=0, anchor="w")
-
-            self.vars[item["path"]] = variable
-
-    def on_toggle(self, item, variable: tk.BooleanVar):
-        item["selected"] = variable.get()
-
-    def add_directory(self, directory: str):
-        if not directory:
-            return
-
-        if any(item["path"] == directory for item in self.config_manager.config.get("src_directories", [])):
-            return
-
-        self.config_manager.config.setdefault("src_directories", []).append(
-            {"path": directory, "selected": True}
-        )
-
-        self.populate()
-
-    def remove_selected(self):
-        old_list = self.config_manager.config.get("src_directories", [])
-        new_list = []
-        for item in old_list:
-            path = item["path"]
-            var = self.vars.get(path)
-            if var is not None and var.get():
-                continue
-            new_list.append(item)
-
-        self.config_manager.config["src_directories"] = new_list
-        self.populate()
-
-
-class EditModelDialog(tk.Toplevel):
-    """
-    Диалог для добавления/редактирования одной модели.
-    """
-    def __init__(self, parent, title="Add Model", model_name="", token_limit=""):
-        super().__init__(parent)
-        self.title(title)
-        self.resizable(False, False)
-        self.result = None
-
-        window_width = 300
-        window_height = 150
-        screen_width = self.winfo_screenwidth()
-        screen_height = self.winfo_screenheight()
-        x = (screen_width - window_width) // 2
-        y = (screen_height - window_height) // 2
-        self.geometry(f"{window_width}x{window_height}+{x}+{y}")
-
-        self.create_widgets(model_name, token_limit)
-
-        self.entry_name.focus_set()
-        self.grab_set()
-
-    def create_widgets(self, model_name, token_limit):
-        label_name = ttk.Label(self, text="Model Name:")
-        label_name.grid(row=0, column=0, padx=5, pady=5, sticky="w")
-
-        self.entry_name = ttk.Entry(self)
-        self.entry_name.grid(row=0, column=1, padx=5, pady=5, sticky="we")
-        self.entry_name.insert(0, model_name)
-
-        label_limit = ttk.Label(self, text="Token Limit:")
-        label_limit.grid(row=1, column=0, padx=5, pady=5, sticky="w")
-
-        self.entry_limit = ttk.Entry(self)
-        self.entry_limit.grid(row=1, column=1, padx=5, pady=5, sticky="we")
-        self.entry_limit.insert(0, token_limit)
-
-        frame_buttons = ttk.Frame(self)
-        frame_buttons.grid(row=2, column=0, columnspan=2, pady=5)
-
-        button_ok = ttk.Button(frame_buttons, text="OK", command=self.on_ok)
-        button_ok.pack(side="left", padx=5)
-
-        button_cancel = ttk.Button(frame_buttons, text="Cancel", command=self.on_cancel)
-        button_cancel.pack(side="left", padx=5)
-
-        self.columnconfigure(1, weight=1)
-
-        self.bind("<Return>", lambda event: self.on_ok())
-        self.bind("<Escape>", lambda event: self.on_cancel())
-
-    def on_ok(self):
-        name = self.entry_name.get().strip()
-
-        try:
-            limit = int(self.entry_limit.get().strip())
-            if limit <= 0:
-                raise ValueError("Limit must be a positive number")
-        except ValueError:
-            messagebox.showerror("Error", "Token limit must be a positive integer.")
-            return
-
-        if not name:
-            messagebox.showerror("Error", "Model name cannot be empty.")
-            return
-
-        self.result = (name, limit)
-        self.destroy()
-
-    def on_cancel(self):
-        self.result = None
-        self.destroy()
-
-
-class CustomModelsDialog(tk.Toplevel):
-    """
-    Окно для управления кастомными моделями (добавление, удаление, редактирование).
-    """
-    def __init__(self, parent, config_manager, update_callback=None):
-        super().__init__(parent)
-        self.title("Manage Custom Models")
-        self.config_manager = config_manager
-        self.update_callback = update_callback
-
-        window_width = 500
-        window_height = 400
-        screen_width = self.winfo_screenwidth()
-        screen_height = self.winfo_screenheight()
-        x = (screen_width - window_width) // 2
-        y = (screen_height - window_height) // 2
-        self.geometry(f"{window_width}x{window_height}+{x}+{y}")
-
-        self.create_widgets()
-        self.refresh_treeview()
-        self.grab_set()
-
-    def create_widgets(self):
-        self.tree = ttk.Treeview(
-            self,
-            columns=("name", "limit"),
-            show="headings",
-            selectmode="browse"
-        )
-
-        self.tree.heading("name", text="Model Name")
-        self.tree.heading("limit", text="Token Limit")
-        self.tree.column("name", width=200)
-        self.tree.column("limit", width=100, anchor="center")
-
-        self.tree.grid(row=0, column=0, columnspan=3, padx=5, pady=5, sticky="nsew")
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        scrollbar.grid(row=0, column=3, pady=5, sticky="ns")
-        self.tree.configure(yscrollcommand=scrollbar.set)
-
-        button_add = ttk.Button(self, text="Add", command=self.add_model)
-        button_add.grid(row=1, column=0, padx=5, pady=5, sticky="we")
-
-        button_edit = ttk.Button(self, text="Edit", command=self.edit_model)
-        button_edit.grid(row=1, column=1, padx=5, pady=5, sticky="we")
-
-        button_delete = ttk.Button(self, text="Delete", command=self.delete_model)
-        button_delete.grid(row=1, column=2, padx=5, pady=5, sticky="we")
-
-        button_close = ttk.Button(self, text="Close", command=self.on_close)
-        button_close.grid(row=2, column=0, columnspan=3, padx=5, pady=5, sticky="we")
-
-        self.rowconfigure(0, weight=1)
-        self.columnconfigure(0, weight=1)
-        self.columnconfigure(1, weight=1)
-        self.columnconfigure(2, weight=1)
-
-        self.tree.bind("<Double-1>", lambda event: self.edit_model())
-
-    def refresh_treeview(self):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-
-        custom_models = self.config_manager.config.get("custom_models", {})
-        for name, limit in custom_models.items():
-            self.tree.insert("", "end", values=(name, limit))
-
-        if self.tree.get_children():
-            self.tree.selection_set(self.tree.get_children()[0])
-
-    def add_model(self):
-        dialog = EditModelDialog(self, title="Add Model")
-        self.wait_window(dialog)
-
-        if dialog.result:
-            name, limit = dialog.result
-            custom_models = self.config_manager.config.get("custom_models", {})
-            if name in custom_models:
-                messagebox.showerror("Error", "A model with this name already exists.")
+            if current_tokens > self.report_header_tokens and current_tokens + project_header_tokens > self.max_tokens:
+                report_parts.append("".join(current_part))
+                current_part = [self.report_header_full, project_header]
+                current_tokens = self.report_header_tokens + project_header_tokens
             else:
-                custom_models[name] = limit
-                self.config_manager.config["custom_models"] = custom_models
-                self.refresh_treeview()
+                current_part.append(project_header)
+                current_tokens += project_header_tokens
 
-    def edit_model(self):
-        selected = self.tree.selection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please select a model to edit.")
+            for file_info in project.files:
+                if self.cancel_flag.is_set(): break
+                current_tokens = self._add_file_to_report(file_info, project, report_parts, current_part,
+                                                          current_tokens)
+
+        if current_part: report_parts.append("".join(current_part))
+        return report_parts
+
+    def _add_file_to_report(self, file_info: FileInfo, project: ProjectInfo, report_parts: List, current_part: List,
+                            current_tokens: int) -> int:
+        relative_path = file_info.file_path.relative_to(project.project_path)
+        file_header = f"#### {relative_path}\n\n```{file_info.language}\n"
+        file_footer = "\n```\n\n"
+        wrapper_tokens = count_tokens(file_header + file_footer)
+
+        project_header = f"## Project: {project.project_name}\n\n{project.structure}"
+        project_header_tokens = count_tokens(project_header)
+
+        if file_info.token_count + wrapper_tokens < self.max_tokens:
+            file_section = f"{file_header}{file_info.code_content}{file_footer}"
+
+            if current_tokens > self.report_header_tokens and current_tokens + file_info.token_count + wrapper_tokens > self.max_tokens:
+                report_parts.append("".join(current_part))
+                current_part.clear()
+                current_part.extend([self.report_header_full, project_header])
+                current_tokens = self.report_header_tokens + project_header_tokens
+
+            current_part.append(file_section)
+            return current_tokens + file_info.token_count + wrapper_tokens
+        else:
+            if current_part:
+                report_parts.append("".join(current_part))
+            current_part.clear()
+
+            logger.warning(f"File {relative_path} is too large for one section and will be chunked.")
+            lines = file_info.code_content.splitlines(keepends=True)
+            chunk_lines = []
+            chunk_tokens = 0
+
+            part_header = f"{self.report_header_full}{project_header}"
+            part_header_tokens = self.report_header_tokens + project_header_tokens
+
+            for line in lines:
+                line_tokens = count_tokens(line)
+                if chunk_tokens + line_tokens + wrapper_tokens + part_header_tokens > self.max_tokens:
+                    report_parts.append(f"{part_header}{file_header}{''.join(chunk_lines)}{file_footer}")
+                    chunk_lines, chunk_tokens = [], 0
+                chunk_lines.append(line)
+                chunk_tokens += line_tokens
+            if chunk_lines:
+                report_parts.append(f"{part_header}{file_header}{''.join(chunk_lines)}{file_footer}")
+
+            current_part.extend([self.report_header_full, project_header])
+            return self.report_header_tokens + project_header_tokens
+
+    def _save_reports(self, parts: List[str]):
+        if not parts:
+            logger.warning("No content generated for reports.")
             return
 
-        item = self.tree.item(selected[0])
-        current_name, current_limit = item["values"]
+        out_file = Path(self.config.unified_output_file)
+        out_file.parent.mkdir(parents=True, exist_ok=True)
 
-        dialog = EditModelDialog(
-            self,
-            title="Edit Model",
-            model_name=current_name,
-            token_limit=str(current_limit)
-        )
-        self.wait_window(dialog)
+        for i, content in enumerate(parts):
+            if self.cancel_flag.is_set(): break
+            path = out_file if len(parts) == 1 else out_file.with_name(f"{out_file.stem}_part{i + 1}{out_file.suffix}")
+            try:
+                path.write_text(content, encoding='utf-8', newline='\n')
+                logger.info(f"Report part saved to {path}")
+            except IOError as e:
+                logger.error(f"Failed to save report part to {path}: {e}", exc_info=True)
 
-        if dialog.result:
-            new_name, new_limit = dialog.result
-            custom_models = self.config_manager.config.get("custom_models", {})
 
-            if new_name != current_name and new_name in custom_models:
-                messagebox.showerror("Error", "A model with this name already exists.")
-                return
+# --- GUI ---
+class ConfigManager:
+    def __init__(self, config_file: Path):
+        self.config_file = config_file
+        self.config = AppConfig()
+        self.load_config()
 
-            del custom_models[current_name]
-            custom_models[new_name] = new_limit
-            self.config_manager.config["custom_models"] = custom_models
-            self.refresh_treeview()
+    def load_config(self) -> None:
+        if not self.config_file.exists(): return
+        try:
+            with self.config_file.open("r", encoding="utf-8") as f:
+                data = json.load(f)
 
-    def delete_model(self):
-        selected = self.tree.selection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please select a model to delete.")
-            return
+            default_dict = asdict(AppConfig())
+            merged_data = {**default_dict, **data}
 
-        item = self.tree.item(selected[0])
-        name = item["values"][0]
+            sources_data = merged_data.get("sources", [])
+            merged_data["sources"] = [SourceConfig(**s) for s in sources_data]
 
-        if messagebox.askyesno("Confirmation", f"Delete model '{name}'?"):
-            custom_models = self.config_manager.config.get("custom_models", {})
-            if name in custom_models:
-                del custom_models[name]
-                self.config_manager.config["custom_models"] = custom_models
-                self.refresh_treeview()
+            valid_keys = {f.name for f in AppConfig.__dataclass_fields__.values()}
+            filtered_data = {k: v for k, v in merged_data.items() if k in valid_keys}
 
-    def on_close(self):
-        self.config_manager.save_config()
-        if self.update_callback:
-            self.update_callback()
-        self.destroy()
+            self.config = AppConfig(**filtered_data)
+        except (json.JSONDecodeError, IOError, TypeError) as e:
+            logger.error(f"Error loading or parsing config file, using defaults: {e}", exc_info=True)
+            self.config = AppConfig()
+
+    def save_config(self, config: AppConfig) -> None:
+        self.config = config
+        try:
+            with self.config_file.open("w", encoding="utf-8") as f:
+                json.dump(asdict(config), f, indent=4)
+        except (IOError, TypeError) as e:
+            logger.error(f"Error saving config: {e}", exc_info=True)
 
 
 class App(TKMT.ThemedTKinterFrame):
-    """
-    Основное приложение с использованием TkinterModernThemes.
-    Слева панель с настройками (Tab-ы), справа — лог и прогресс.
-    """
-    def __init__(self, config_manager, theme="sun-valley", mode="dark"):
-        super().__init__("Code Report Generator", theme, mode)
+    def __init__(self, config_manager: ConfigManager, theme: str, mode: str):
+        super().__init__(APP_NAME, theme, mode)
         self.config_manager = config_manager
-        self.processor = None
+        self.config = copy.deepcopy(config_manager.config)
+        self.processor: Optional[ProjectProcessor] = None
+        self.executor: Optional[concurrent.futures.Executor] = None
+        self.is_processing = False
+        self.log_buffer: List[LogMessage] = []
+        self.log_buffer_timer: Optional[str] = None
+        self._log_tags_configured = False
 
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        window_width = min(950, screen_width - 100)
-        window_height = min(700, screen_height - 100)
-        x_position = (screen_width - window_width) // 2
-        y_position = (screen_height - window_height) // 2
-
-        self.root.geometry(f"{window_width}x{window_height}+{x_position}+{y_position}")
-        self.create_widgets()
-        self.poll_log_queue()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.root.minsize(800, 600)
+        self.root.minsize(900, 750)
+        self.center_window()
+
+        self.create_widgets()
+        self.load_config_into_ui()
+        self.process_ui_queue()
+
+    def center_window(self):
+        self.root.update_idletasks()
+        width = self.root.winfo_width()
+        height = self.root.winfo_height()
+        x = (self.root.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.root.winfo_screenheight() // 2) - (height // 2)
+        self.root.geometry(f'{width}x{height}+{x}+{y}')
 
     def create_widgets(self):
-        main_frame = ttk.Frame(self.root)
-        main_frame.pack(fill='both', expand=True, padx=5, pady=5)
+        main_pane = ttk.PanedWindow(self.root, orient="horizontal")
+        main_pane.pack(fill="both", expand=True, padx=10, pady=10)
 
-        self.paned_window = ttk.PanedWindow(main_frame, orient="horizontal")
-        self.paned_window.pack(fill='both', expand=True)
+        settings_pane = ttk.Frame(main_pane)
+        log_pane = ttk.Frame(main_pane)
+        main_pane.add(settings_pane, weight=1)
+        main_pane.add(log_pane, weight=2)
 
-        self.settings_frame = ttk.Frame(self.paned_window)
-        self.paned_window.add(self.settings_frame, weight=1)
+        self._create_settings_ui(settings_pane)
+        self._create_log_ui(log_pane)
 
-        self.log_frame = ttk.Frame(self.paned_window)
-        self.paned_window.add(self.log_frame, weight=1)
+    def _create_settings_ui(self, parent):
+        notebook = ttk.Notebook(parent)
+        notebook.pack(fill="both", expand=True, pady=5)
 
-        self._create_settings_section()
-        self._create_logs_section()
+        tabs = {"Sources": ttk.Frame(notebook), "File Options": ttk.Frame(notebook), "Advanced": ttk.Frame(notebook)}
+        for name, frame in tabs.items(): notebook.add(frame, text=name)
 
-    def _create_settings_section(self):
-        title_label = ttk.Label(self.settings_frame, text="Project Settings", font=("", 12, "bold"))
-        title_label.pack(fill="x", padx=5, pady=(5, 10))
+        self._create_sources_tab(tabs["Sources"])
+        self._create_file_options_tab(tabs["File Options"])
+        self._create_advanced_tab(tabs["Advanced"])
 
-        settings_notebook = ttk.Notebook(self.settings_frame)
-        settings_notebook.pack(fill="both", expand=True, padx=5, pady=5)
+        action_frame = ttk.Frame(parent)
+        action_frame.pack(fill="x", pady=10)
+        self.btn_start = ttk.Button(action_frame, text="Start Processing", command=self.start_processing)
+        self.btn_start.pack(side="left", expand=True, fill="x", padx=5)
+        self.btn_cancel = ttk.Button(action_frame, text="Cancel", command=self.cancel_processing, state="disabled")
+        self.btn_cancel.pack(side="left", expand=True, fill="x", padx=5)
 
-        directories_frame = ttk.Frame(settings_notebook)
-        files_frame = ttk.Frame(settings_notebook)
-        output_frame = ttk.Frame(settings_notebook)
-        models_frame = ttk.Frame(settings_notebook)
+    def _create_sources_tab(self, parent):
+        frame = ttk.Frame(parent)
+        frame.pack(fill="both", expand=True, padx=5, pady=5)
 
-        settings_notebook.add(directories_frame, text="Directories")
-        settings_notebook.add(files_frame, text="Files")
-        settings_notebook.add(output_frame, text="Output")
-        settings_notebook.add(models_frame, text="Models")
+        self.source_tree = ttk.Treeview(frame, columns=("type", "path"), show="headings", selectmode="browse")
+        self.source_tree.heading("type", text="Type", anchor="w")
+        self.source_tree.heading("path", text="Path / URL", anchor="w")
+        self.source_tree.column("type", width=80, stretch=tk.NO)
 
-        self._create_directories_tab(directories_frame)
-        self._create_files_tab(files_frame)
-        self._create_output_tab(output_frame)
-        self._create_models_tab(models_frame)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.source_tree.yview)
+        self.source_tree.configure(yscrollcommand=scrollbar.set)
 
-        button_frame = ttk.Frame(self.settings_frame)
-        button_frame.pack(fill="x", padx=5, pady=10)
+        self.source_tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
 
-        self.button_start = ttk.Button(
-            button_frame,
-            text="Start Processing",
-            command=self.start_processing
-        )
-        self.button_start.pack(side="left", expand=True, fill="x", padx=5)
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill="x", padx=5, pady=5)
+        ttk.Button(btn_frame, text="Add Directory...", command=self.add_local_directory).pack(side="left", expand=True,
+                                                                                              fill="x", padx=2)
+        ttk.Button(btn_frame, text="Add Git URL...", command=self.add_git_url).pack(side="left", expand=True, fill="x",
+                                                                                    padx=2)
+        ttk.Button(btn_frame, text="Remove Selected", command=self.remove_selected_source).pack(side="left",
+                                                                                                expand=True, fill="x",
+                                                                                                padx=2)
 
-        self.button_cancel = ttk.Button(
-            button_frame,
-            text="Cancel",
-            command=self.cancel_processing,
-            state="disabled"
-        )
-        self.button_cancel.pack(side="left", expand=True, fill="x", padx=5)
+    def _create_file_options_tab(self, parent):
+        self.extensions_var = tk.StringVar()
+        self.include_libs_var = tk.BooleanVar()
+        self.remove_comments_var = tk.BooleanVar()
+        self.preserve_docstrings_var = tk.BooleanVar()
+        self.unified_output_var = tk.StringVar()
 
-        self.status_var = tk.StringVar(value="Ready")
-        status_label = ttk.Label(self.settings_frame, textvariable=self.status_var, font=("", 9, "italic"))
-        status_label.pack(fill="x", padx=5, pady=5)
+        ttk.Label(parent, text="File Extensions (comma-separated, * for all):").pack(anchor="w", padx=5, pady=(5, 0))
+        ttk.Entry(parent, textvariable=self.extensions_var).pack(fill="x", padx=5, pady=2)
 
-    def _create_directories_tab(self, parent):
-        frame_directories = ttk.LabelFrame(parent, text="Source Directories")
-        frame_directories.pack(fill="both", expand=True, padx=5, pady=5)
+        ttk.Label(parent, text="Unified Report Filename:").pack(anchor="w", padx=5, pady=(10, 0))
+        ttk.Entry(parent, textvariable=self.unified_output_var).pack(fill="x", padx=5, pady=2)
 
-        self.dir_frame = DirectorySelectionFrame(frame_directories, self.config_manager)
-        self.dir_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        options_frame = ttk.LabelFrame(parent, text="Processing Options", padding=5)
+        options_frame.pack(fill="x", padx=5, pady=10)
 
-        button_frame = ttk.Frame(parent)
-        button_frame.pack(fill="x", padx=5, pady=5)
+        ttk.Checkbutton(options_frame, text="Include hidden/library directories", variable=self.include_libs_var).pack(
+            anchor="w")
+        ttk.Checkbutton(options_frame, text="Remove comments from code", variable=self.remove_comments_var,
+                        command=self.sync_docstring_option_state).pack(anchor="w")
+        self.cb_preserve_docstrings = ttk.Checkbutton(options_frame, text="Preserve docstrings (if removing comments)",
+                                                      variable=self.preserve_docstrings_var)
+        self.cb_preserve_docstrings.pack(anchor="w", padx=20)
 
-        button_add_directory = ttk.Button(
-            button_frame,
-            text="Add Directory",
-            command=self.add_directory
-        )
-        button_add_directory.pack(side="left", expand=True, fill="x", padx=5)
+    def _create_advanced_tab(self, parent):
+        self.selected_model_var = tk.StringVar()
+        self.log_level_var = tk.StringVar()
+        self.max_threads_var = tk.IntVar()
+        self.max_file_size_var = tk.IntVar()
 
-        button_remove_directory = ttk.Button(
-            button_frame,
-            text="Remove Selected",
-            command=self.remove_directory
-        )
-        button_remove_directory.pack(side="left", expand=True, fill="x", padx=5)
+        model_frame = ttk.LabelFrame(parent, text="Model and Performance", padding=5)
+        model_frame.pack(fill="x", padx=5, pady=5)
 
-        self.include_libraries_var = tk.BooleanVar(value=self.config_manager.config.get("include_libraries", False))
-        checkbox_include_libraries = ttk.Checkbutton(
-            parent,
-            text="Include Library Directories",
-            variable=self.include_libraries_var
-        )
-        checkbox_include_libraries.pack(anchor="w", padx=10, pady=5)
+        ttk.Label(model_frame, text="Model for Token Limit:").pack(anchor="w")
+        self.combo_model = ttk.Combobox(model_frame, textvariable=self.selected_model_var, state="readonly")
+        self.combo_model.pack(fill="x", pady=2)
 
-    def _create_files_tab(self, parent):
-        frame_extensions = ttk.LabelFrame(parent, text="File Extensions (comma separated)")
-        frame_extensions.pack(fill="x", padx=5, pady=5)
+        manage_models_btn = ttk.Button(model_frame, text="Manage Custom Models...", state="disabled")
+        manage_models_btn.pack(fill="x", pady=(5, 0))
+        if hasattr(TKMT, "CreateToolTip"):
+            TKMT.CreateToolTip(manage_models_btn, "This feature is not yet implemented.")
 
-        self.entry_extensions = ttk.Entry(frame_extensions)
-        self.entry_extensions.pack(fill="x", padx=5, pady=5)
-        self.entry_extensions.insert(
-            0,
-            ", ".join(self.config_manager.config.get("extensions", []))
-        )
+        cpu_count = os.cpu_count() or 1
+        ttk.Label(model_frame, text=f"Max Processing Threads (1-{cpu_count}):").pack(anchor="w", pady=(10, 0))
+        ttk.Spinbox(model_frame, from_=1, to=cpu_count, textvariable=self.max_threads_var).pack(fill="x", pady=2)
 
-        frame_comments = ttk.LabelFrame(parent, text="Comment Removal Options")
-        frame_comments.pack(fill="x", padx=5, pady=5)
+        ttk.Label(model_frame, text="Max File Size to Process (MB):").pack(anchor="w", pady=(10, 0))
+        ttk.Spinbox(model_frame, from_=1, to=200, textvariable=self.max_file_size_var).pack(fill="x", pady=2)
 
-        self.remove_comments_var = tk.BooleanVar(value=self.config_manager.config.get("remove_comments", True))
-        checkbox_remove_comments = ttk.Checkbutton(
-            frame_comments,
-            text="Remove Comments from Code",
-            variable=self.remove_comments_var
-        )
-        checkbox_remove_comments.pack(anchor="w", padx=5, pady=5)
+        logging_frame = ttk.LabelFrame(parent, text="Logging", padding=5)
+        logging_frame.pack(fill="x", padx=5, pady=5)
+        ttk.Label(logging_frame, text="Log Level:").pack(anchor="w")
+        ttk.Combobox(logging_frame, textvariable=self.log_level_var,
+                     values=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], state="readonly").pack(fill="x", pady=2)
 
-        self.preserve_docstrings_var = tk.BooleanVar(value=self.config_manager.config.get("preserve_docstrings", True))
-        checkbox_preserve_docstrings = ttk.Checkbutton(
-            frame_comments,
-            text="Preserve Docstrings",
-            variable=self.preserve_docstrings_var
-        )
-        checkbox_preserve_docstrings.pack(anchor="w", padx=5, pady=5)
+    def _create_log_ui(self, parent):
+        ttk.Label(parent, text="Logs & Progress", font=("", 12, "bold")).pack(fill="x", pady=(0, 10))
+        self.log_text = scrolledtext.ScrolledText(parent, wrap='none', state='disabled', height=10)
+        self.log_text.pack(fill='both', expand=True, pady=5)
 
-        frame_size = ttk.LabelFrame(parent, text="File Size Limit (MB)")
-        frame_size.pack(fill="x", padx=5, pady=5)
+        is_dark_theme = self.config.ui_theme == UIMode.DARK.value
+        self.log_text.tag_config("ERROR", foreground="#FF6B6B" if is_dark_theme else "#D8000C")
+        self.log_text.tag_config("CRITICAL", foreground="#FF6B6B" if is_dark_theme else "#D8000C", font=("", 9, "bold"))
+        self.log_text.tag_config("WARNING", foreground="#FFD166" if is_dark_theme else "#9F6000")
+        self.log_text.tag_config("INFO", foreground="#A9A9A9" if is_dark_theme else "#555555")
+        self.log_text.tag_config("DEBUG", foreground="#6A7A8A" if is_dark_theme else "#888888")
+        self._log_tags_configured = True
 
-        self.spinner_max_file_size = ttk.Spinbox(
-            frame_size,
-            from_=1,
-            to=100,
-            increment=1
-        )
-        self.spinner_max_file_size.pack(fill="x", padx=5, pady=5)
-        self.spinner_max_file_size.set(self.config_manager.config.get("max_file_size_mb", 50))
+        self.status_var = tk.StringVar(value="Ready.")
+        ttk.Label(parent, textvariable=self.status_var, wraplength=400).pack(fill="x", padx=5)
 
-    def _create_output_tab(self, parent):
-        frame_output = ttk.LabelFrame(parent, text="Output File Templates")
-        frame_output.pack(fill="x", padx=5, pady=5)
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(parent, variable=self.progress_var)
+        self.progress_bar.pack(fill="x", padx=5, pady=5)
 
-        label_output_template = ttk.Label(frame_output, text="Per-project output file:")
-        label_output_template.pack(anchor="w", padx=5, pady=2)
+    def load_config_into_ui(self):
+        self.extensions_var.set(", ".join(self.config.extensions))
+        self.include_libs_var.set(self.config.include_libraries)
+        self.remove_comments_var.set(self.config.remove_comments)
+        self.preserve_docstrings_var.set(self.config.preserve_docstrings)
+        self.unified_output_var.set(self.config.unified_output_file)
+        self.selected_model_var.set(self.config.selected_model)
+        self.log_level_var.set(self.config.log_level)
+        self.max_threads_var.set(self.config.max_threads)
+        self.max_file_size_var.set(self.config.max_file_size_mb)
 
-        self.entry_output_template = ttk.Entry(frame_output)
-        self.entry_output_template.pack(fill="x", padx=5, pady=2)
-        self.entry_output_template.insert(
-            0,
-            self.config_manager.config.get("output_file_template", "{project_name}_report.md")
-        )
-
-        label_unified_output = ttk.Label(frame_output, text="Unified report file:")
-        label_unified_output.pack(anchor="w", padx=5, pady=2)
-
-        self.entry_unified_output = ttk.Entry(frame_output)
-        self.entry_unified_output.pack(fill="x", padx=5, pady=2)
-        self.entry_unified_output.insert(
-            0,
-            self.config_manager.config.get("unified_output_file", "unified_report.md")
-        )
-
-        frame_report_options = ttk.LabelFrame(parent, text="Report Options")
-        frame_report_options.pack(fill="x", padx=5, pady=5)
-
-        self.unified_report_var = tk.BooleanVar(value=self.config_manager.config.get("unified_report", True))
-        checkbox_unified_report = ttk.Checkbutton(
-            frame_report_options,
-            text="Generate Unified Report",
-            variable=self.unified_report_var
-        )
-        checkbox_unified_report.pack(anchor="w", padx=5, pady=5)
-
-        frame_performance = ttk.LabelFrame(parent, text="Performance Settings")
-        frame_performance.pack(fill="x", padx=5, pady=5)
-
-        label_max_threads = ttk.Label(frame_performance, text="Maximum threads:")
-        label_max_threads.pack(anchor="w", padx=5, pady=2)
-
-        self.spinner_max_threads = ttk.Spinbox(
-            frame_performance,
-            from_=1,
-            to=16,
-            increment=1,
-            width=5
-        )
-        self.spinner_max_threads.pack(anchor="w", padx=5, pady=2)
-        self.spinner_max_threads.set(self.config_manager.config.get("max_threads", 4))
-
-    def _create_models_tab(self, parent):
-        frame_model = ttk.LabelFrame(parent, text="Model Selection")
-        frame_model.pack(fill="x", padx=5, pady=5)
-
-        label_model = ttk.Label(frame_model, text="Select model:")
-        label_model.pack(anchor="w", padx=5, pady=2)
-
-        self.combo_model = ttk.Combobox(frame_model)
-        self.combo_model.pack(fill="x", padx=5, pady=2)
         self.update_model_combobox()
+        self.populate_source_tree()
+        self.sync_docstring_option_state()
 
-        button_manage_models = ttk.Button(
-            frame_model,
-            text="Manage Custom Models",
-            command=self.manage_models
-        )
-        button_manage_models.pack(fill="x", padx=5, pady=5)
-
-        frame_logging = ttk.LabelFrame(parent, text="Logging")
-        frame_logging.pack(fill="x", padx=5, pady=5)
-
-        label_log_level = ttk.Label(frame_logging, text="Log level:")
-        label_log_level.pack(anchor="w", padx=5, pady=2)
-
-        self.combo_log_level = ttk.Combobox(
-            frame_logging,
-            values=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
-        )
-        self.combo_log_level.pack(fill="x", padx=5, pady=2)
-        self.combo_log_level.set(self.config_manager.config.get("log_level", "INFO"))
-
-    def _create_logs_section(self):
-        title_label = ttk.Label(self.log_frame, text="Logs & Progress", font=("", 12, "bold"))
-        title_label.pack(fill="x", padx=5, pady=(5, 10))
-
-        self.text_log = scrolledtext.ScrolledText(self.log_frame, wrap='none', state='disabled', height=20)
-        self.text_log.pack(fill='both', expand=True, padx=5, pady=5)
-
-        progress_frame = ttk.Frame(self.log_frame)
-        progress_frame.pack(fill='x', padx=5, pady=5)
-
-        self.progress_label = ttk.Label(progress_frame, text="Waiting", anchor="w")
-        self.progress_label.pack(fill='x', padx=5, pady=2)
-
-        self.progress_var = tk.DoubleVar(value=0)
-        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100)
-        self.progress_bar.pack(fill='x', padx=5, pady=2)
-
-        self.button_clear_log = ttk.Button(
-            progress_frame,
-            text="Clear Logs",
-            command=self.clear_logs
-        )
-        self.button_clear_log.pack(anchor="e", padx=5, pady=5)
-
-    def update_model_combobox(self):
-        models = set(BUILTIN_MODEL_CONTEXT_SIZES.keys())
-        custom = self.config_manager.config.get("custom_models", {})
-        models.update(custom.keys())
-        models_list = sorted(models)
-
-        self.combo_model["values"] = models_list
-
-        current = self.combo_model.get()
-        if not current or current not in models_list:
-            self.combo_model.set("Gemini")
-
-    def manage_models(self):
-        CustomModelsDialog(self.root, self.config_manager, update_callback=self.update_model_combobox)
-
-    def add_directory(self):
-        directory_path = filedialog.askdirectory()
-        if directory_path:
-            self.dir_frame.add_directory(directory_path)
-
-    def remove_directory(self):
-        self.dir_frame.remove_selected()
-
-    def clear_logs(self):
-        self.text_log.configure(state='normal')
-        self.text_log.delete(1.0, tk.END)
-        self.text_log.configure(state='disabled')
+    def gather_ui_into_config(self):
+        self.config.extensions = [e.strip() for e in self.extensions_var.get().split(',') if e.strip()]
+        self.config.include_libraries = self.include_libs_var.get()
+        self.config.remove_comments = self.remove_comments_var.get()
+        self.config.preserve_docstrings = self.preserve_docstrings_var.get()
+        self.config.unified_output_file = self.unified_output_var.get()
+        self.config.selected_model = self.selected_model_var.get()
+        self.config.log_level = self.log_level_var.get()
+        self.config.max_threads = self.max_threads_var.get()
+        self.config.max_file_size_mb = self.max_file_size_var.get()
 
     def start_processing(self):
-        source_directories = [
-            item for item in self.config_manager.config.get("src_directories", [])
-            if item.get("selected", True)
-        ]
+        if self.is_processing: return
+        self.gather_ui_into_config()
+        self.config_manager.save_config(self.config)
 
-        if not source_directories:
-            messagebox.showwarning("Warning", "No directories selected.")
+        if not self.config.sources:
+            messagebox.showwarning("Input Required", "Please add at least one source directory or Git URL.")
             return
 
-        extensions_text = self.entry_extensions.get().strip()
-        if not extensions_text:
-            messagebox.showwarning("Warning", "No file extensions specified.")
-            return
+        self.set_processing_state(True)
+        setup_logging(self.config.log_level)
 
-        # Сохраняем настройки в конфиг
-        self.config_manager.config["output_file_template"] = self.entry_output_template.get().strip()
-        self.config_manager.config["unified_output_file"] = self.entry_unified_output.get().strip()
-
-        extensions = [ext.strip() for ext in extensions_text.split(',') if ext.strip()]
-        self.config_manager.config["extensions"] = extensions
-
-        self.config_manager.config["include_libraries"] = self.include_libraries_var.get()
-        self.config_manager.config["remove_comments"] = self.remove_comments_var.get()
-        self.config_manager.config["preserve_docstrings"] = self.preserve_docstrings_var.get()
-        self.config_manager.config["unified_report"] = self.unified_report_var.get()
-        self.config_manager.config["log_level"] = self.combo_log_level.get()
-        self.config_manager.config["selected_model"] = self.combo_model.get()
-
-        try:
-            max_threads = int(self.spinner_max_threads.get())
-            if max_threads < 1:
-                max_threads = 1
-            elif max_threads > 16:
-                max_threads = 16
-            self.config_manager.config["max_threads"] = max_threads
-        except ValueError:
-            self.config_manager.config["max_threads"] = 4
-
-        try:
-            max_file_size = int(self.spinner_max_file_size.get())
-            if max_file_size < 1:
-                max_file_size = 1
-            elif max_file_size > 100:
-                max_file_size = 100
-            self.config_manager.config["max_file_size_mb"] = max_file_size
-        except ValueError:
-            self.config_manager.config["max_file_size_mb"] = 50
-
-        logger.setLevel(getattr(logging, self.config_manager.config["log_level"].upper(), logging.INFO))
-        self.config_manager.save_config()
-        self._set_processing_state(True)
-
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.config.max_threads,
+                                                              thread_name_prefix="Worker")
         self.processor = ProjectProcessor(
-            self.config_manager.config,
-            progress_callback=self.update_progress,
-            status_callback=self.update_status
+            config=self.config, code_processor=CodeProcessor(),
+            executor=self.executor, ui_queue=ui_event_queue
         )
-
-        threading.Thread(target=self._run_processing, daemon=True).start()
-
-    def _run_processing(self):
-        try:
-            result = self.processor.run()
-            self.root.after(100, lambda: self._processing_completed(result))
-        except Exception as error:
-            logger.error(f"Error during processing: {error}", exc_info=True)
-            self.root.after(100, lambda: self._processing_completed(False, str(error)))
-
-    def _processing_completed(self, success: bool, error_message: str = None):
-        self._set_processing_state(False)
-
-        if success:
-            self.status_var.set("Processing completed successfully")
-            self.progress_label.config(text="Completed")
-        else:
-            self.status_var.set(f"Error: {error_message}" if error_message else "Processing interrupted")
-            self.progress_label.config(text="Interrupted")
-
-            if error_message:
-                messagebox.showerror("Error", f"An error occurred during processing: {error_message}")
-
-        self.processor = None
+        threading.Thread(target=self.processor.run, daemon=True).start()
 
     def cancel_processing(self):
-        if self.processor:
-            self.processor.cancel()
-            self.status_var.set("Canceling operation...")
-            self.progress_label.config(text="Canceling...")
+        self.status_var.set("Cancelling...")
+        if self.processor: self.processor.cancel()
+        self.btn_start.config(state="disabled")
+        self.btn_cancel.config(state="disabled")
 
-    def _set_processing_state(self, is_processing: bool):
+    def set_processing_state(self, is_processing: bool):
+        self.is_processing = is_processing
+        self.btn_start.config(state="disabled" if is_processing else "normal")
+        self.btn_cancel.config(state="normal" if is_processing else "disabled")
         if is_processing:
-            self.button_start.configure(state="disabled")
-            self.button_cancel.configure(state="normal")
+            self.progress_bar.config(mode="determinate")
             self.progress_var.set(0)
-            self.status_var.set("Processing...")
-            self.progress_label.config(text="Preparing...")
+            self.status_var.set("Starting...")
         else:
-            self.button_start.configure(state="normal")
-            self.button_cancel.configure(state="disabled")
+            self.progress_var.set(0)
 
-    def update_progress(self, current: int, total: int):
-        progress_percent = (current / total) * 100 if total else 0
-        self.progress_var.set(progress_percent)
-        self.progress_label.config(text=f"Progress: {current}/{total} ({progress_percent:.1f}%)")
+    def process_ui_queue(self):
+        try:
+            while not ui_event_queue.empty():
+                event = ui_event_queue.get_nowait()
+                if isinstance(event, StatusUpdate):
+                    self.status_var.set(event.message)
+                elif isinstance(event, ProgressUpdate):
+                    self.progress_var.set((event.current / event.total) * 100 if event.total > 0 else 0)
+                elif isinstance(event, LogMessage):
+                    self.log_buffer.append(event)
+                elif isinstance(event, TaskFinished):
+                    self.set_processing_state(False)
+                    if self.executor:
+                        self.executor.shutdown(wait=False)
+                        self.executor = None
+                    self.processor = None
+                    self.status_var.set(
+                        "Processing finished." if event.success else "Processing failed or was cancelled.")
+        except queue.Empty:
+            pass
+        finally:
+            if not self.log_buffer_timer and self.log_buffer:
+                self.log_buffer_timer = self.root.after(100, self.flush_log_buffer)
+            self.root.after(100, self.process_ui_queue)
 
-    def update_status(self, message: str):
-        self.status_var.set(message)
-        self.progress_label.config(text=message)
+    def flush_log_buffer(self):
+        self.log_buffer_timer = None
+        if not self.log_buffer: return
 
-    def poll_log_queue(self):
-        while not log_queue.empty():
-            try:
-                message = log_queue.get_nowait()
-            except queue.Empty:
-                break
-            else:
-                self.append_log(message)
-        self.root.after(100, self.poll_log_queue)
+        self.log_text.configure(state='normal')
+        if not self._log_tags_configured:
+            self._create_log_ui(self.log_text.master)
 
-    def append_log(self, message: str):
-        self.text_log.configure(state='normal')
-        self.text_log.insert(tk.END, message + "\n")
-        self.text_log.configure(state='disabled')
-        self.text_log.see(tk.END)
+        for log_event in self.log_buffer:
+            level_name = logging.getLevelName(log_event.level)
+            tags = (level_name,) if level_name in self.log_text.tag_names() else ()
+            self.log_text.insert(tk.END, log_event.message + '\n', tags)
+        self.log_text.configure(state='disabled')
+        self.log_text.see(tk.END)
+        self.log_buffer.clear()
+
+    def populate_source_tree(self):
+        self.source_tree.delete(*self.source_tree.get_children())
+        for source in self.config.sources:
+            self.source_tree.insert("", "end", values=(source.type, source.path))
+
+    def add_local_directory(self):
+        path = filedialog.askdirectory(title="Select Project Directory")
+        if path and not any(s.path == path for s in self.config.sources):
+            self.config.sources.append(SourceConfig(path=path, type=SourceType.LOCAL.name))
+            self.populate_source_tree()
+
+    def add_git_url(self):
+        url = simpledialog.askstring("Add Git Repository", "Enter repository URL (HTTPS):", parent=self.root)
+        if url and (url.startswith("http://") or url.startswith("https://")):
+            if not any(s.path == url for s in self.config.sources):
+                self.config.sources.append(SourceConfig(path=url, type=SourceType.GIT.name))
+                self.populate_source_tree()
+        elif url:
+            messagebox.showwarning("Invalid URL", "Please enter a valid HTTP/HTTPS URL.")
+
+    def remove_selected_source(self):
+        selected = self.source_tree.selection()
+        if not selected: return
+        path_to_remove = self.source_tree.item(selected[0])["values"][1]
+        self.config.sources = [s for s in self.config.sources if s.path != path_to_remove]
+        self.populate_source_tree()
+
+    def update_model_combobox(self):
+        models = sorted(list(BUILTIN_MODEL_CONTEXT_SIZES.keys()) + list(self.config.custom_models.keys()))
+        self.combo_model['values'] = models
+        if self.selected_model_var.get() not in models:
+            self.selected_model_var.set(DEFAULT_MODEL)
+
+    def sync_docstring_option_state(self):
+        state = "normal" if self.remove_comments_var.get() else "disabled"
+        self.cb_preserve_docstrings.config(state=state)
 
     def on_close(self):
-        if self.processor and not self.processor.cancel_flag.is_set():
-            if messagebox.askyesno("Confirmation", "Processing is not complete. Are you sure you want to exit?"):
-                if self.processor:
-                    self.processor.cancel()
-                self.config_manager.save_config()
-                self.root.destroy()
-        else:
-            self.config_manager.save_config()
-            self.root.destroy()
+        if self.is_processing:
+            if not messagebox.askyesno("Confirm Exit", "Processing is active. Are you sure you want to exit?"):
+                return
+            if self.processor: self.processor.cancel()
+            if self.executor: self.executor.shutdown(wait=True)
+
+        self.gather_ui_into_config()
+        self.config_manager.save_config(self.config)
+
+        if self.log_buffer_timer: self.root.after_cancel(self.log_buffer_timer)
+        self.root.destroy()
 
 
 if __name__ == "__main__":
-    theme = config_manager.config.get("ui_theme", "dark")
-    app = App(config_manager, theme="sun-valley", mode=theme)
+    config_manager = ConfigManager(CONFIG_FILE)
+    setup_logging(config_manager.config.log_level)
+
+    app = App(config_manager, theme=UI_THEME_NAME, mode=config_manager.config.ui_theme)
     app.run()
