@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
 import concurrent.futures
 import copy
 import importlib.util
@@ -19,18 +18,30 @@ import tempfile
 import threading
 import tkinter as tk
 import tokenize
-from dataclasses import dataclass, field, asdict
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field, asdict, fields
 from enum import Enum
 from functools import lru_cache
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
-from typing import List, Optional, Tuple, Dict, Union
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+from typing import List, Optional, Tuple, Dict, Union, Type, Callable
 
 # --- Dependency Check ---
 def check_dependencies() -> List[str]:
-    required = ["tiktoken", "charset_normalizer", "pygments", "TKinterModernThemes"]
-    return [lib for lib in required if not importlib.util.find_spec(lib)]
+    # (module_to_check, package_to_install)
+    required = [
+        ("tiktoken", "tiktoken"),
+        ("charset_normalizer", "charset_normalizer"),
+        ("pygments", "pygments"),
+        ("TKinterModernThemes", "TKinterModernThemes"),
+        ("git", "GitPython")
+    ]
+    missing = []
+    for module, package in required:
+        if not importlib.util.find_spec(module):
+            missing.append(package)
+    return missing
 
 
 missing_deps = check_dependencies()
@@ -50,7 +61,7 @@ import git
 from charset_normalizer import from_bytes
 from pygments.lexers import guess_lexer_for_filename
 from pygments.util import ClassNotFound
-import TKinterModernThemes as TKMT
+import TKinterModernThemes as tkmt
 
 
 # --- Constants & Enums ---
@@ -88,6 +99,7 @@ BUILTIN_MODEL_CONTEXT_SIZES = {
 class SourceConfig:
     path: str
     type: str
+    branch: Optional[str] = None
 
 
 @dataclass
@@ -104,6 +116,14 @@ class ProjectInfo:
     project_path: Path
     structure: str
     files: List[FileInfo]
+
+
+@dataclass
+class SourceData:
+    project_name: str
+    project_path: Path
+    files_to_process: List[Path]
+    structure_text: str
 
 
 @dataclass
@@ -170,8 +190,8 @@ def setup_logging(level: str) -> None:
         file_handler.setLevel(log_level)
         file_handler.name = HANDLER_NAME_FILE
         logger.addHandler(file_handler)
-    except (IOError, PermissionError) as e:
-        print(f"Could not create log file handler: {e}", file=sys.stderr)
+    except (IOError, PermissionError) as exc:
+        print(f"Could not create log file handler: {exc}", file=sys.stderr)
 
     class UIQueueLogHandler(logging.Handler):
         def emit(self, record: logging.LogRecord) -> None:
@@ -189,8 +209,8 @@ setup_logging("INFO")
 
 try:
     ENCODER = tiktoken.get_encoding("cl100k_base")
-except Exception as e:
-    logger.critical(f"Failed to initialize tiktoken encoder: {e}", exc_info=True)
+except Exception as exc:
+    logger.critical(f"Failed to initialize tiktoken encoder: {exc}", exc_info=True)
     sys.exit(1)
 
 
@@ -201,7 +221,8 @@ def count_tokens(text: str) -> int:
 
 # --- Core Logic ---
 class CodeProcessor:
-    def is_binary(self, file_path: Path) -> bool:
+    @staticmethod
+    def is_binary(file_path: Path) -> bool:
         try:
             with file_path.open('rb') as f:
                 chunk = f.read(BIN_DETECT_CHUNK_SIZE)
@@ -211,11 +232,12 @@ class CodeProcessor:
 
             non_text_chars = sum(1 for byte in chunk if byte < 9 or (13 < byte < 32 and byte != 27) or byte > 127)
             return non_text_chars / len(chunk) > 0.3
-        except (IOError, OSError) as e:
-            logger.warning(f"Could not check file type for {file_path}: {e}", exc_info=True)
+        except (IOError, OSError) as exc:
+            logger.warning(f"Could not check file type for {file_path}: {exc}", exc_info=True)
             return True
 
-    def detect_encoding(self, file_path: Path, max_size_mb: int) -> Optional[str]:
+    @staticmethod
+    def detect_encoding(file_path: Path, max_size_mb: int) -> Optional[str]:
         try:
             file_size = file_path.stat().st_size
             if file_size > max_size_mb * 1024 * 1024:
@@ -227,18 +249,20 @@ class CodeProcessor:
                 raw_data = f.read(read_size)
             result = from_bytes(raw_data).best()
             return result.encoding if result else 'utf-8'
-        except (IOError, OSError) as e:
-            logger.error(f"Error detecting encoding for {file_path}: {e}", exc_info=True)
+        except (IOError, OSError) as exc:
+            logger.error(f"Error detecting encoding for {file_path}: {exc}", exc_info=True)
             return None
 
-    def read_file_safely(self, file_path: Path, encoding: str) -> Optional[str]:
+    @staticmethod
+    def read_file_safely(file_path: Path, encoding: str) -> Optional[str]:
         try:
             return file_path.read_text(encoding=encoding, errors='replace')
-        except (IOError, OSError) as e:
-            logger.error(f"Error reading file {file_path}: {e}", exc_info=True)
+        except (IOError, OSError) as exc:
+            logger.error(f"Error reading file {file_path}: {exc}", exc_info=True)
             return None
 
-    def remove_python_comments(self, source: str, preserve_docstrings: bool) -> str:
+    @staticmethod
+    def remove_python_comments(source: str, preserve_docstrings: bool) -> str:
         try:
             tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
             if preserve_docstrings:
@@ -252,98 +276,56 @@ class CodeProcessor:
                     continue
                 result_tokens.append(token)
             return tokenize.untokenize(result_tokens)
-        except (tokenize.TokenError, IndentationError) as e:
-            logger.warning(f"Python tokenization failed: {e}. Falling back to basic regex.")
+        except (tokenize.TokenError, IndentationError) as exc:
+            logger.warning(f"Python tokenization failed: {exc}. Falling back to basic regex.")
             return re.sub(r'#.*', '', source)
 
-    def remove_comments(self, file_path: Path, source: str, preserve_docstrings: bool) -> str:
+    @staticmethod
+    def remove_comments(file_path: Path, source: str, preserve_docstrings: bool) -> str:
         if file_path.suffix.lower() == '.py':
-            return self.remove_python_comments(source, preserve_docstrings)
+            return CodeProcessor.remove_python_comments(source, preserve_docstrings)
         pattern = r"//.*?$|/\*.*?\*/|--.*?$"
         return re.sub(pattern, "", source, flags=re.MULTILINE | re.DOTALL)
 
-    def detect_language(self, file_path: Path, content: str) -> str:
+    @staticmethod
+    def detect_language(file_path: Path, content: str) -> str:
         try:
             lexer = guess_lexer_for_filename(file_path.name, content)
             return lexer.aliases[0] if lexer.aliases else lexer.name.lower()
         except ClassNotFound:
             return file_path.suffix.lstrip('.').lower() or 'text'
 
-
-class ProjectProcessor:
-    def __init__(self, config: AppConfig, code_processor: CodeProcessor,
-                 executor: concurrent.futures.Executor, ui_queue: queue.Queue[UIEvent]):
-        self.config = config
-        self.code_processor = code_processor
-        self.executor = executor
-        self.ui_queue = ui_queue
-        self.cancel_flag = threading.Event()
-        self.temp_dirs: List[Path] = []
-
-        models = {**BUILTIN_MODEL_CONTEXT_SIZES, **self.config.custom_models}
-        self.max_tokens = models.get(self.config.selected_model, 128000)
-        self.report_header_full = f"{REPORT_HEADER_TEXT}\n\n"
-        self.report_header_tokens = count_tokens(self.report_header_full)
-
-    def cancel(self):
-        self.cancel_flag.set()
-        self.ui_queue.put(StatusUpdate(message="Cancellation requested by user."))
-
-    def _clone_repo(self, url: str) -> Optional[Path]:
-        try:
-            temp_dir = Path(tempfile.mkdtemp(prefix="crg_"))
-            self.ui_queue.put(StatusUpdate(message=f"Cloning {url}..."))
-            git.Repo.clone_from(url, temp_dir, depth=1)
-            self.temp_dirs.append(temp_dir)
-            self.ui_queue.put(StatusUpdate(message="Clone successful."))
-            return temp_dir
-        except git.GitCommandError as e:
-            logger.error(f"Failed to clone {url}: {e}", exc_info=True)
-            self.ui_queue.put(StatusUpdate(message=f"Error cloning {url}."))
-            return None
-
-    def _process_file(self, file_path: Path) -> Optional[FileInfo]:
-        if self.cancel_flag.is_set(): return None
-
-        encoding = self.code_processor.detect_encoding(file_path, self.config.max_file_size_mb)
+    def process_file(self, file_path: Path, config: AppConfig) -> Optional[FileInfo]:
+        encoding = self.detect_encoding(file_path, config.max_file_size_mb)
         if not encoding: return None
 
-        content = self.code_processor.read_file_safely(file_path, encoding)
+        content = self.read_file_safely(file_path, encoding)
         if content is None: return None
 
-        if self.config.remove_comments:
-            content = self.code_processor.remove_comments(file_path, content, self.config.preserve_docstrings)
+        if config.remove_comments:
+            content = self.remove_comments(file_path, content, config.preserve_docstrings)
 
         return FileInfo(
             file_path=file_path,
-            language=self.code_processor.detect_language(file_path, content),
+            language=self.detect_language(file_path, content),
             code_content=content.strip(),
             token_count=count_tokens(content)
         )
 
-    def _gather_project_files(self, project_path: Path) -> Tuple[List[Path], str]:
-        files_to_scan = []
-        structure_dirs = set()
-        extensions = set(self.config.extensions)
-        use_wildcard = "*" in extensions
 
-        for root, dirs, files in os.walk(project_path, topdown=True):
-            if self.cancel_flag.is_set(): break
+class SourceProvider(ABC):
+    def __init__(self, source_config: SourceConfig, ui_queue: queue.Queue):
+        self.config = source_config
+        self.ui_queue = ui_queue
+        self.temp_dir: Optional[Path] = None
 
-            if not self.config.include_libraries:
-                dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith('.')]
+    @abstractmethod
+    def prepare(self) -> Optional[Path]:
+        """Prepares the source (e.g., clones repo, checks path) and returns the path to it."""
+        pass
 
-            for file_name in files:
-                file_path = Path(root) / file_name
-                if use_wildcard or file_path.suffix.lower() in extensions:
-                    if not self.code_processor.is_binary(file_path):
-                        files_to_scan.append(file_path)
-                        structure_dirs.add(Path(root))
-
-        structure_text = self._build_structure_text(project_path, structure_dirs)
-        return sorted(files_to_scan), structure_text
-
-    def _build_structure_text(self, root: Path, dirs: set) -> str:
+    @staticmethod
+    def _build_structure_text(root: Path, dirs: set) -> str:
         lines = ["### Project Structure:\n"]
         sorted_paths = sorted(list(p for p in dirs if p != root), key=lambda p: p.as_posix())
 
@@ -356,76 +338,78 @@ class ProjectProcessor:
                 continue
         return "".join(lines) + "\n"
 
-    def run(self) -> None:
-        all_projects_info: List[ProjectInfo] = []
+    def gather_data(self, project_path: Path, extensions: set, include_libs: bool,
+                      is_binary_checker: Callable[[Path], bool]) -> SourceData:
+        files_to_scan = []
+        structure_dirs = set()
+        use_wildcard = "*" in extensions
+
+        for dir_path, dirs, files in os.walk(project_path, topdown=True):
+            if not include_libs:
+                dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith('.')]
+
+            for file_name in files:
+                file_path = Path(dir_path) / file_name
+                if use_wildcard or file_path.suffix.lower() in extensions:
+                    if not is_binary_checker(file_path):
+                        files_to_scan.append(file_path)
+                        structure_dirs.add(Path(dir_path))
+
+        structure_text = self._build_structure_text(project_path, structure_dirs)
+        return SourceData(
+            project_name=project_path.name,
+            project_path=project_path,
+            files_to_process=sorted(files_to_scan),
+            structure_text=structure_text
+        )
+
+    def cleanup(self):
+        """Cleans up temporary resources."""
+        if self.temp_dir and self.temp_dir.exists():
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+            logger.info(f"Cleaned up temporary directory: {self.temp_dir}")
+
+
+class LocalSourceProvider(SourceProvider):
+    def prepare(self) -> Optional[Path]:
+        path = Path(self.config.path)
+        if not path.is_dir():
+            logger.error(f"Local path is not a valid directory: {path}")
+            self.ui_queue.put(StatusUpdate(message=f"Error: Path not found {path}"))
+            return None
+        return path
+
+
+class GitSourceProvider(SourceProvider):
+    def prepare(self) -> Optional[Path]:
         try:
-            sources_to_process = self.config.sources
-            total_projects = len(sources_to_process)
-            for i, source in enumerate(sources_to_process, 1):
-                if self.cancel_flag.is_set(): break
-                self.ui_queue.put(StatusUpdate(message=f"Processing project {i}/{total_projects}: {source.path}"))
+            self.temp_dir = Path(tempfile.mkdtemp(prefix="crg_git_"))
+            branch_info = f" (branch: {self.config.branch})" if self.config.branch else ""
+            self.ui_queue.put(StatusUpdate(message=f"Cloning {self.config.path}{branch_info}..."))
 
-                try:
-                    source_type = SourceType[source.type.upper()]
-                except KeyError:
-                    logger.error(f"Invalid source type in config: {source.type}")
-                    continue
+            clone_kwargs = {'depth': 1}
+            if self.config.branch:
+                clone_kwargs['branch'] = self.config.branch
 
-                project_name: str
-                project_path: Optional[Path]
+            git.Repo.clone_from(self.config.path, self.temp_dir, **clone_kwargs)
+            self.ui_queue.put(StatusUpdate(message="Clone successful."))
+            return self.temp_dir
+        except git.GitCommandError as exc:
+            logger.error(f"Failed to clone {self.config.path}: {exc}", exc_info=True)
+            self.ui_queue.put(StatusUpdate(message=f"Error cloning {self.config.path}."))
+            self.cleanup()
+            return None
 
-                if source_type == SourceType.GIT:
-                    project_name = Path(source.path).stem
-                    project_path = self._clone_repo(source.path)
-                else:
-                    project_path = Path(source.path)
-                    project_name = project_path.name
 
-                if not project_path or not project_path.is_dir():
-                    logger.warning(f"Source not valid or failed to clone: {source.path}")
-                    continue
+class ReportGenerator:
+    def __init__(self, max_tokens: int, cancel_flag: threading.Event):
+        self.max_tokens = max_tokens
+        self.cancel_flag = cancel_flag
+        self.report_header_full = f"{REPORT_HEADER_TEXT}\n\n"
+        self.report_header_tokens = count_tokens(self.report_header_full)
 
-                files_to_process, structure = self._gather_project_files(project_path)
-                total_files = len(files_to_process)
-                if total_files == 0: continue
-
-                processed_files: List[FileInfo] = []
-                futures = {self.executor.submit(self._process_file, fp): fp for fp in files_to_process}
-
-                for processed_count, future in enumerate(concurrent.futures.as_completed(futures), 1):
-                    if self.cancel_flag.is_set(): break
-                    try:
-                        result = future.result()
-                        if result: processed_files.append(result)
-                    except Exception as e:
-                        file_path = futures[future]
-                        logger.error(f"Error processing file {file_path}: {e}", exc_info=True)
-
-                    self.ui_queue.put(ProgressUpdate(current=processed_count, total=total_files))
-
-                if not self.cancel_flag.is_set():
-                    all_projects_info.append(ProjectInfo(
-                        project_name=project_name, project_path=project_path,
-                        structure=structure, files=sorted(processed_files, key=lambda f: f.file_path)
-                    ))
-
-            if not self.cancel_flag.is_set():
-                report_parts = self._generate_report_parts(all_projects_info)
-                self._save_reports(report_parts)
-
-            self.ui_queue.put(TaskFinished(success=not self.cancel_flag.is_set()))
-
-        except Exception as e:
-            logger.critical(f"Unhandled exception in processor thread: {e}", exc_info=True)
-            self.ui_queue.put(TaskFinished(success=False))
-        finally:
-            for temp_dir in self.temp_dirs:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-
-    def _generate_report_parts(self, all_projects: List[ProjectInfo]) -> List[str]:
-        self.ui_queue.put(StatusUpdate(message="Generating report parts..."))
+    def generate(self, all_projects: List[ProjectInfo]) -> List[str]:
         report_parts = []
-
         current_part = [self.report_header_full]
         current_tokens = self.report_header_tokens
 
@@ -448,7 +432,9 @@ class ProjectProcessor:
                 current_tokens = self._add_file_to_report(file_info, project, report_parts, current_part,
                                                           current_tokens)
 
-        if current_part: report_parts.append("".join(current_part))
+        if current_part and "".join(current_part).strip() != self.report_header_full.strip():
+            report_parts.append("".join(current_part))
+
         return report_parts
 
     def _add_file_to_report(self, file_info: FileInfo, project: ProjectInfo, report_parts: List, current_part: List,
@@ -461,9 +447,11 @@ class ProjectProcessor:
         project_header = f"## Project: {project.project_name}\n\n{project.structure}"
         project_header_tokens = count_tokens(project_header)
 
-        if file_info.token_count + wrapper_tokens < self.max_tokens:
+        # Check if the file itself is smaller than the total context window
+        if file_info.token_count + wrapper_tokens + self.report_header_tokens + project_header_tokens < self.max_tokens:
             file_section = f"{file_header}{file_info.code_content}{file_footer}"
 
+            # If adding this file exceeds the current part's limit, start a new part
             if current_tokens > self.report_header_tokens and current_tokens + file_info.token_count + wrapper_tokens > self.max_tokens:
                 report_parts.append("".join(current_part))
                 current_part.clear()
@@ -473,11 +461,12 @@ class ProjectProcessor:
             current_part.append(file_section)
             return current_tokens + file_info.token_count + wrapper_tokens
         else:
-            if current_part:
+            # File is too large, needs chunking. Finish the current part first.
+            if len(current_part) > 1:
                 report_parts.append("".join(current_part))
-            current_part.clear()
+            current_part.clear() # Prepare for the next part after chunking
 
-            logger.warning(f"File {relative_path} is too large for one section and will be chunked.")
+            logger.warning(f"File {relative_path} is too large and will be chunked across multiple report parts.")
             lines = file_info.code_content.splitlines(keepends=True)
             chunk_lines = []
             chunk_tokens = 0
@@ -486,6 +475,7 @@ class ProjectProcessor:
             part_header_tokens = self.report_header_tokens + project_header_tokens
 
             for line in lines:
+                if self.cancel_flag.is_set(): break
                 line_tokens = count_tokens(line)
                 if chunk_tokens + line_tokens + wrapper_tokens + part_header_tokens > self.max_tokens:
                     report_parts.append(f"{part_header}{file_header}{''.join(chunk_lines)}{file_footer}")
@@ -495,8 +485,91 @@ class ProjectProcessor:
             if chunk_lines:
                 report_parts.append(f"{part_header}{file_header}{''.join(chunk_lines)}{file_footer}")
 
-            current_part.extend([self.report_header_full, project_header])
-            return self.report_header_tokens + project_header_tokens
+            current_part.extend([self.report_header_full])
+            return self.report_header_tokens
+
+
+class ProjectProcessor:
+    def __init__(self, config: AppConfig, code_processor: CodeProcessor,
+                 executor: concurrent.futures.Executor, ui_queue: queue.Queue[UIEvent]):
+        self.config = config
+        self.code_processor = code_processor
+        self.executor = executor
+        self.ui_queue = ui_queue
+        self.cancel_flag = threading.Event()
+        self.source_providers_map: Dict[str, Type[SourceProvider]] = {
+            SourceType.LOCAL.name: LocalSourceProvider,
+            SourceType.GIT.name: GitSourceProvider,
+        }
+
+    def cancel(self):
+        self.cancel_flag.set()
+        self.ui_queue.put(StatusUpdate(message="Cancellation requested by user."))
+
+    def run(self) -> None:
+        all_projects_info: List[ProjectInfo] = []
+        active_providers: List[SourceProvider] = []
+
+        try:
+            total_projects = len(self.config.sources)
+            for i, source_config in enumerate(self.config.sources, 1):
+                if self.cancel_flag.is_set(): break
+                self.ui_queue.put(StatusUpdate(message=f"Processing project {i}/{total_projects}: {source_config.path}"))
+
+                provider_class = self.source_providers_map.get(source_config.type)
+                if not provider_class:
+                    logger.error(f"Invalid source type in config: {source_config.type}")
+                    continue
+
+                provider = provider_class(source_config, self.ui_queue)
+                active_providers.append(provider)
+
+                project_path = provider.prepare()
+                if not project_path: continue
+
+                source_data = provider.gather_data(project_path, set(self.config.extensions),
+                                                   self.config.include_libraries, self.code_processor.is_binary)
+
+                if not source_data.files_to_process: continue
+
+                processed_files: List[FileInfo] = []
+                futures = {self.executor.submit(self.code_processor.process_file, fp, self.config): fp for fp in
+                           source_data.files_to_process}
+
+                total_files = len(source_data.files_to_process)
+                for processed_count, future in enumerate(concurrent.futures.as_completed(futures), 1):
+                    if self.cancel_flag.is_set(): break
+                    try:
+                        result = future.result()
+                        if result: processed_files.append(result)
+                    except Exception as exc:
+                        logger.error(f"Error processing file {futures[future]}: {exc}", exc_info=True)
+                    self.ui_queue.put(ProgressUpdate(current=processed_count, total=total_files))
+
+                if self.cancel_flag.is_set(): break
+
+                all_projects_info.append(ProjectInfo(
+                    project_name=source_data.project_name, project_path=project_path,
+                    structure=source_data.structure_text, files=sorted(processed_files, key=lambda f: f.file_path)
+                ))
+
+            if not self.cancel_flag.is_set():
+                models = {**BUILTIN_MODEL_CONTEXT_SIZES, **self.config.custom_models}
+                max_tokens = models.get(self.config.selected_model, 128000)
+                report_generator = ReportGenerator(max_tokens, self.cancel_flag)
+
+                self.ui_queue.put(StatusUpdate(message="Generating report parts..."))
+                report_parts = report_generator.generate(all_projects_info)
+                self._save_reports(report_parts)
+
+            self.ui_queue.put(TaskFinished(success=not self.cancel_flag.is_set()))
+
+        except Exception as exc:
+            logger.critical(f"Unhandled exception in processor thread: {exc}", exc_info=True)
+            self.ui_queue.put(TaskFinished(success=False))
+        finally:
+            for provider in active_providers:
+                provider.cleanup()
 
     def _save_reports(self, parts: List[str]):
         if not parts:
@@ -512,8 +585,8 @@ class ProjectProcessor:
             try:
                 path.write_text(content, encoding='utf-8', newline='\n')
                 logger.info(f"Report part saved to {path}")
-            except IOError as e:
-                logger.error(f"Failed to save report part to {path}: {e}", exc_info=True)
+            except IOError as exc:
+                logger.error(f"Failed to save report part to {path}: {exc}", exc_info=True)
 
 
 # --- GUI ---
@@ -533,14 +606,19 @@ class ConfigManager:
             merged_data = {**default_dict, **data}
 
             sources_data = merged_data.get("sources", [])
-            merged_data["sources"] = [SourceConfig(**s) for s in sources_data]
+            merged_data["sources"] = []
+            for s_item in sources_data:
+                # Handle old configs without 'branch'
+                if 'branch' not in s_item:
+                    s_item['branch'] = None
+                merged_data["sources"].append(SourceConfig(**s_item))
 
-            valid_keys = {f.name for f in AppConfig.__dataclass_fields__.values()}
+            valid_keys = {f.name for f in fields(AppConfig)}
             filtered_data = {k: v for k, v in merged_data.items() if k in valid_keys}
 
             self.config = AppConfig(**filtered_data)
-        except (json.JSONDecodeError, IOError, TypeError) as e:
-            logger.error(f"Error loading or parsing config file, using defaults: {e}", exc_info=True)
+        except (json.JSONDecodeError, IOError, TypeError) as exc:
+            logger.error(f"Error loading or parsing config file, using defaults: {exc}", exc_info=True)
             self.config = AppConfig()
 
     def save_config(self, config: AppConfig) -> None:
@@ -548,11 +626,11 @@ class ConfigManager:
         try:
             with self.config_file.open("w", encoding="utf-8") as f:
                 json.dump(asdict(config), f, indent=4)
-        except (IOError, TypeError) as e:
-            logger.error(f"Error saving config: {e}", exc_info=True)
+        except (IOError, TypeError) as exc:
+            logger.error(f"Error saving config: {exc}", exc_info=True)
 
 
-class App(TKMT.ThemedTKinterFrame):
+class App(tkmt.ThemedTKinterFrame):
     def __init__(self, config_manager: ConfigManager, theme: str, mode: str):
         super().__init__(APP_NAME, theme, mode)
         self.config_manager = config_manager
@@ -614,10 +692,12 @@ class App(TKMT.ThemedTKinterFrame):
         frame = ttk.Frame(parent)
         frame.pack(fill="both", expand=True, padx=5, pady=5)
 
-        self.source_tree = ttk.Treeview(frame, columns=("type", "path"), show="headings", selectmode="browse")
+        self.source_tree = ttk.Treeview(frame, columns=("type", "path", "branch"), show="headings", selectmode="browse")
         self.source_tree.heading("type", text="Type", anchor="w")
         self.source_tree.heading("path", text="Path / URL", anchor="w")
+        self.source_tree.heading("branch", text="Branch", anchor="w")
         self.source_tree.column("type", width=80, stretch=tk.NO)
+        self.source_tree.column("branch", width=100, stretch=tk.NO)
 
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.source_tree.yview)
         self.source_tree.configure(yscrollcommand=scrollbar.set)
@@ -676,8 +756,8 @@ class App(TKMT.ThemedTKinterFrame):
 
         manage_models_btn = ttk.Button(model_frame, text="Manage Custom Models...", state="disabled")
         manage_models_btn.pack(fill="x", pady=(5, 0))
-        if hasattr(TKMT, "CreateToolTip"):
-            TKMT.CreateToolTip(manage_models_btn, "This feature is not yet implemented.")
+        if hasattr(tkmt, "CreateToolTip"):
+            tkmt.CreateToolTip(manage_models_btn, "This feature is not yet implemented.")
 
         cpu_count = os.cpu_count() or 1
         ttk.Label(model_frame, text=f"Max Processing Threads (1-{cpu_count}):").pack(anchor="w", pady=(10, 0))
@@ -819,7 +899,7 @@ class App(TKMT.ThemedTKinterFrame):
     def populate_source_tree(self):
         self.source_tree.delete(*self.source_tree.get_children())
         for source in self.config.sources:
-            self.source_tree.insert("", "end", values=(source.type, source.path))
+            self.source_tree.insert("", "end", values=(source.type, source.path, source.branch or ''))
 
     def add_local_directory(self):
         path = filedialog.askdirectory(title="Select Project Directory")
@@ -828,19 +908,31 @@ class App(TKMT.ThemedTKinterFrame):
             self.populate_source_tree()
 
     def add_git_url(self):
-        url = simpledialog.askstring("Add Git Repository", "Enter repository URL (HTTPS):", parent=self.root)
-        if url and (url.startswith("http://") or url.startswith("https://")):
-            if not any(s.path == url for s in self.config.sources):
-                self.config.sources.append(SourceConfig(path=url, type=SourceType.GIT.name))
-                self.populate_source_tree()
-        elif url:
-            messagebox.showwarning("Invalid URL", "Please enter a valid HTTP/HTTPS URL.")
+        dialog = GitUrlDialog(self.root, "Add Git Repository")
+        self.root.wait_window(dialog.top) # Wait for dialog to close
+
+        if dialog.result:
+            url, branch = dialog.result
+            if url and (url.startswith("http://") or url.startswith("https://")):
+                if not any(s.path == url and s.branch == branch for s in self.config.sources):
+                    self.config.sources.append(SourceConfig(path=url, type=SourceType.GIT.name, branch=branch))
+                    self.populate_source_tree()
+            elif url:
+                messagebox.showwarning("Invalid URL", "Please enter a valid HTTP/HTTPS URL.", parent=self.root)
 
     def remove_selected_source(self):
-        selected = self.source_tree.selection()
-        if not selected: return
-        path_to_remove = self.source_tree.item(selected[0])["values"][1]
-        self.config.sources = [s for s in self.config.sources if s.path != path_to_remove]
+        selected_item = self.source_tree.selection()
+        if not selected_item: return
+
+        item_values = self.source_tree.item(selected_item[0])["values"]
+        path_to_remove = item_values[1]
+        branch_to_remove_str = item_values[2]
+        branch_to_remove = branch_to_remove_str if branch_to_remove_str else None
+
+        self.config.sources = [
+            s for s in self.config.sources
+            if not (s.path == path_to_remove and s.branch == branch_to_remove)
+        ]
         self.populate_source_tree()
 
     def update_model_combobox(self):
@@ -865,6 +957,44 @@ class App(TKMT.ThemedTKinterFrame):
 
         if self.log_buffer_timer: self.root.after_cancel(self.log_buffer_timer)
         self.root.destroy()
+
+
+class GitUrlDialog:
+    def __init__(self, parent, title):
+        self.top = tk.Toplevel(parent)
+        self.top.title(title)
+        self.top.transient(parent)
+        self.top.grab_set()
+
+        self.url_var = tk.StringVar()
+        self.branch_var = tk.StringVar()
+        self.result: Optional[Tuple[str, Optional[str]]] = None
+
+        ttk.Label(self.top, text="Repository URL (HTTPS):").pack(padx=10, pady=(10, 2))
+        url_entry = ttk.Entry(self.top, textvariable=self.url_var, width=50)
+        url_entry.pack(padx=10, pady=2, fill="x", expand=True)
+
+        ttk.Label(self.top, text="Branch (optional, leave empty for default):").pack(padx=10, pady=(10, 2))
+        ttk.Entry(self.top, textvariable=self.branch_var, width=50).pack(padx=10, pady=2, fill="x", expand=True)
+
+        button_frame = ttk.Frame(self.top)
+        button_frame.pack(padx=10, pady=10, fill="x")
+        ttk.Button(button_frame, text="OK", command=self.on_ok).pack(side="right", padx=5)
+        ttk.Button(button_frame, text="Cancel", command=self.top.destroy).pack(side="right")
+
+        url_entry.focus_set()
+        self.top.wait_visibility()
+        parent.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() // 2) - (self.top.winfo_width() // 2)
+        y = parent.winfo_y() + (parent.winfo_height() // 2) - (self.top.winfo_height() // 2)
+        self.top.geometry(f"+{x}+{y}")
+
+
+    def on_ok(self):
+        url = self.url_var.get().strip()
+        branch = self.branch_var.get().strip() or None
+        self.result = (url, branch)
+        self.top.destroy()
 
 
 if __name__ == "__main__":
